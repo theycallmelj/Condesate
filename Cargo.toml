@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/ai-swarm", "crates/chat-app"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "io-util"] }
+async-trait = "0.1"
+anyhow = "1"
+serde_json = "1"

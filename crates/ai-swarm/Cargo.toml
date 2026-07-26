@@ -1,0 +1,25 @@
+[package]
+name = "ai-swarm"
+version.workspace = true
+edition.workspace = true
+description = "A trait-driven AI agent harness with a swarm layer that behaves like a tiny OS."
+
+[lib]
+name = "ai_swarm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "demo"
+path = "src/main.rs"
+
+[features]
+# Real network model providers (OpenAI / Anthropic). Off by default so the core
+# library, the demo, and the test suite build fast and fully offline.
+remote = ["dep:reqwest"]
+
+[dependencies]
+tokio = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"], optional = true }

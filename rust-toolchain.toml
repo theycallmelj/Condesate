@@ -1,0 +1,4 @@
+# The `remote` feature (reqwest) needs a current stable toolchain (edition 2024).
+# The offline core builds on much older toolchains too.
+[toolchain]
+channel = "stable"

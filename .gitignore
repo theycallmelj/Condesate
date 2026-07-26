@@ -1,0 +1,16 @@
+# Rust build artifacts
+/target
+**/target
+
+# Backtrace / debug
+*.pdb
+
+# Env files with secrets (API keys)
+.env
+.env.*
+
+# OS / editor cruft
+.DS_Store
+*.swp
+.idea/
+.vscode/

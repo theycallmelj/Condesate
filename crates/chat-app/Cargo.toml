@@ -1,0 +1,16 @@
+[package]
+name = "chat-app"
+version.workspace = true
+edition.workspace = true
+description = "A simple REPL chat app built on ai-swarm. Offline by default; real providers behind the `remote` feature."
+
+[features]
+default = []
+# Enable real OpenAI / Anthropic connectivity (pulls reqwest via ai-swarm).
+remote = ["ai-swarm/remote"]
+
+[dependencies]
+ai-swarm = { path = "../ai-swarm" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
