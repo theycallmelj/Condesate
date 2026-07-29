@@ -33,7 +33,7 @@
 //!   Applied per item, after arrival, before the value reaches a model.
 
 use super::entry::{CacheEntry, CacheKey, Demand, RejectReason, Sidecar, ValueClass};
-use crate::identity::{GovernanceLabel, ModelClass};
+use crate::security::identity::{GovernanceLabel, ModelClass};
 use crate::types::HarnessId;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -147,7 +147,7 @@ pub trait SketchPublisher: Send + Sync {
 
 /// What a node knows about its peers' holdings.
 ///
-/// In this codebase the transport underneath is the [`crate::bus::Bus`]; across
+/// In this codebase the transport underneath is the [`crate::swarm::bus::Bus`]; across
 /// machines it would be a gossip layer. Either way the directory is
 /// eventually-consistent and always incomplete, and the planner must behave
 /// sanely when it is stale.

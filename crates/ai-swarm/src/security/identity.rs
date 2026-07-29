@@ -15,7 +15,7 @@
 //!     scope, policy version). Labels travel *with* cached values so a semantic
 //!     hit can still be refused on authorization grounds.
 //!
-//! Nothing here performs a check. [`crate::policy`] does that.
+//! Nothing here performs a check. [`super::policy`] does that.
 
 use std::fmt;
 
@@ -185,7 +185,7 @@ pub enum Compatibility {
 
 /// The subject of an access check: a running harness plus its credentials.
 ///
-/// Built by the kernel at spawn time (see [`crate::kernel`]); never constructed
+/// Built by the kernel at spawn time (see [`super::kernel`]); never constructed
 /// by an agent or a tool, because a principal that can name itself can lie.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Principal {
@@ -200,7 +200,7 @@ pub struct Principal {
     /// Privilege band.
     pub trust: TrustTier,
     /// Who spawned this principal, if anyone. Grants may only ever be a subset
-    /// of the parent's — see [`crate::policy::GrantSet::attenuate`].
+    /// of the parent's — see [`super::policy::GrantSet::attenuate`].
     pub parent: Option<crate::types::HarnessId>,
 }
 

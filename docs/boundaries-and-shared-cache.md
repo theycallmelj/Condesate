@@ -273,7 +273,8 @@ Federation touches the permission plane at three distinct points, which is why
 
 ## 4. What is real and what is not
 
-**Implemented and tested (22 tests across the new modules):**
+**Implemented and tested (57 tests across `ai-swarm`, including 12 in `faraday` —
+see [faraday-context-engineering.md](faraday-context-engineering.md)):**
 - `RuleSetPolicy` evaluation: default deny, deny-wins, conditions, structural
   tenant isolation
 - `GrantSet::attenuate` and pattern containment
@@ -282,6 +283,17 @@ Federation touches the permission plane at three distinct points, which is why
   revocation and filtered key listings
 - `MemoryAudit`, event summaries, refusal filtering
 - Model-class compatibility and pool-key derivation; pool byte budgeting
+- **The gating is live**, not just unit-tested in isolation: `Tool::call` takes
+  `&GuardedServices` (no raw `ServiceHandle` reachable from tool code),
+  `Harness::run` takes `Arc<GuardedServices>`, and `Swarm` admits every
+  registered harness through a `Kernel` before spawning it — see §1.9 below.
+- **Attenuation is enforced, not just computed.** `GuardedServices::check`
+  evaluates against the admitted principal's own `GrantSet`, not a
+  shared/global one — a manifest's dropped rules are genuinely unusable, not
+  merely absent from a report. `Rule::covers` requires subject containment
+  (agent pattern, tenant, trust floor, model class) as well as resource
+  containment, so a child cannot silently drop a parent's `min_trust`
+  restriction while keeping the resource/action shape of the rule.
 
 **Traits with no implementation yet:** `CachePool`, `CacheRegistry`,
 `Validator`, `SketchPublisher`, `SketchDirectory`, `PullPlanner`,
@@ -289,15 +301,47 @@ Federation touches the permission plane at three distinct points, which is why
 
 **Known gaps, in the order they should be closed:**
 
-1. **Tools still take `&ServiceHandle`.** Until `Tool::call` takes a
-   `&GuardedServices`, the guard is an *additional* gate rather than the only
-   one. This is the single most important next change.
-2. **`Swarm` does not build a `Kernel`.** Harnesses get a raw `ServiceHandle` at
-   spawn; admission needs to happen in `Swarm::register`/`run`.
-3. **No `begin_activation` call in `StandardHarness`.** Without it every audit
-   record correlates to `"boot"`, and per-activation step and byte budgets never
-   reset.
-4. **No in-memory `CachePool`.** Needed before any of the cache path can be
+1. **No in-memory `CachePool`.** Needed before any of the cache path can be
    tested end to end.
-5. **`prev_digest` is unused.** Hash-chaining the audit trail makes silent
+2. **`prev_digest` is unused.** Hash-chaining the audit trail makes silent
    deletion detectable; cheap to add, hard to retrofit meaningfully.
+3. **`Escalate`/`Deny` requests bypass the coverage check in `GrantSet::attenuate`.**
+   A child can mint an `Escalate` rule for a resource its parent's grants never
+   mention at all (only `Allow` requests are checked against parent coverage).
+   Escalation still requires approval, so this is not a direct privilege
+   escalation, but it is a softer guarantee than the `Allow` path gets and is
+   worth tightening.
+4. **Nothing in `faraday` is wired into the running loop yet.** `Diary`,
+   `IdeaBook`, and the `Slip`/`RetrievalSheet` composition path are real and
+   tested, but no `Harness` or `AgentLoop` writes to one during a real
+   activation. See [faraday-context-engineering.md](faraday-context-engineering.md).
+
+### 1.9 Tool-call gating, end to end
+
+The path from a model's tool call to an executed effect now has no unguarded
+hop:
+
+```
+  BasicAgent::think            filters tool specs the model is even told about
+        │                      via GuardedServices::may_advertise (advertise-time)
+        ▼
+  loops::execute_tools         calls GuardedServices::authorize_tool(name)
+        │                      BEFORE invoking the tool — the authoritative
+        │                      call-time gate, independent of advertise-time
+        ▼
+  Tool::call(&GuardedServices) the tool itself holds no raw ServiceHandle;
+                                every storage/bus/cache access it makes goes
+                                through the same check → audit → effect path
+```
+
+A denied call does not error the activation out — it becomes a tool
+observation (`"tool 'x' denied: ..."`), the same way a tool's own runtime
+error would, so the agent can see why and adapt rather than the whole loop
+crashing.
+
+`Swarm::register` now takes an `AgentManifest` alongside each `Harness`;
+`Swarm::run` admits it through the swarm's `Kernel` and hands the harness an
+`Arc<GuardedServices>`, never a `ServiceHandle`. There is no special case for
+top-level harnesses — a manifest with no parent still attenuates against the
+kernel's root the same way a spawned child attenuates against its parent, so
+"declare what you need" applies uniformly.

@@ -16,6 +16,10 @@ path = "src/main.rs"
 # Real network model providers (OpenAI / Anthropic). Off by default so the core
 # library, the demo, and the test suite build fast and fully offline.
 remote = ["dep:reqwest"]
+# Tools backed by real MCP servers over the official rmcp SDK. Off by default
+# for the same reason as `remote`. Client-only: spawns a server as a child
+# process and speaks MCP over its stdio.
+mcp = ["dep:rmcp"]
 
 [dependencies]
 tokio = { workspace = true }
@@ -23,3 +27,10 @@ async-trait = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"], optional = true }
+rmcp = { version = "3.0.0", default-features = false, features = ["client", "transport-child-process"], optional = true }
+
+[dev-dependencies]
+# Widens the `mcp` feature's rmcp build, test-only: an in-process server (over
+# a duplex pipe, no child process) is how mcp.rs proves the permission
+# boundary stops a denied call before it ever reaches the transport.
+rmcp = { version = "3.0.0", default-features = false, features = ["server", "transport-async-rw"] }

@@ -27,11 +27,11 @@
 //! ```
 //!
 //! Gate 3 is not the cache's decision. A pool returns [`Candidate`]s, not hits;
-//! the kernel turns candidates into hits by asking [`crate::policy`]. Keeping
-//! the naming honest here is what stops "the embeddings matched" from quietly
-//! becoming "the agent was allowed to see it".
+//! the kernel turns candidates into hits by asking [`crate::security::policy`].
+//! Keeping the naming honest here is what stops "the embeddings matched" from
+//! quietly becoming "the agent was allowed to see it".
 //!
-//! [`ModelClass`]: crate::identity::ModelClass
+//! [`ModelClass`]: crate::security::identity::ModelClass
 
 pub mod entry;
 pub mod federation;
@@ -49,7 +49,7 @@ pub use pool::{CachePool, CacheRegistry, PoolUsage, StandardValidator, Validator
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::{Compatibility, ModelClass};
+    use crate::security::identity::{Compatibility, ModelClass};
 
     fn class(family: &str, revision: &str, space: Option<&str>) -> ModelClass {
         ModelClass {

@@ -5,9 +5,9 @@
 //! decide how many times to run — that's the `AgentLoop`'s job. This separation
 //! is what lets you keep the same agent but change its control flow.
 
-use crate::model::ModelProvider;
-use crate::service::ServiceHandle;
-use crate::tool::Tool;
+use super::model::ModelProvider;
+use super::tool::Tool;
+use crate::security::kernel::GuardedServices;
 use crate::types::{CompletionRequest, CompletionResponse, Message};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -17,12 +17,13 @@ use std::sync::Arc;
 pub struct AgentContext {
     /// Growing conversation transcript for this activation.
     pub transcript: Vec<Message>,
-    /// Swarm services (storage, bus, identity) available to tools.
-    pub services: ServiceHandle,
+    /// The guarded syscall surface available to tools — storage, bus,
+    /// identity, all subject to whatever this principal was admitted with.
+    pub services: Arc<GuardedServices>,
 }
 
 impl AgentContext {
-    pub fn new(services: ServiceHandle) -> Self {
+    pub fn new(services: Arc<GuardedServices>) -> Self {
         Self { transcript: Vec::new(), services }
     }
 }
@@ -76,11 +77,17 @@ impl Agent for BasicAgent {
         messages.push(Message::system(self.system_prompt.clone()));
         messages.extend(ctx.transcript.iter().cloned());
 
-        let req = CompletionRequest {
-            messages,
-            tools: self.tools.iter().map(|t| t.spec()).collect(),
-            temperature: 0.0,
-        };
+        // Advertise-time gating: the model is only told about tools this
+        // principal may actually invoke. Narrower than the call-time check in
+        // `loops::execute_tools`, which remains authoritative regardless.
+        let tools = self
+            .tools
+            .iter()
+            .filter(|t| ctx.services.may_advertise(&t.spec().name))
+            .map(|t| t.spec())
+            .collect();
+
+        let req = CompletionRequest { messages, tools, temperature: 0.0 };
         self.provider.complete(req).await
     }
 }

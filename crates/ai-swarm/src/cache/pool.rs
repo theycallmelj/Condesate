@@ -28,13 +28,13 @@
 //! 2. **Compatibility** — may this model class reuse this value class?
 //!    ([`Compatibility`] vs [`ValueClass::min_compatibility`])
 //! 3. **Authorization** — may *this principal* see *this label*?
-//!    ([`crate::policy::PolicyEngine`], applied by [`crate::kernel`])
+//!    ([`crate::security::policy::PolicyEngine`], applied by [`crate::security::kernel`])
 //!
-//! [`Compatibility`]: crate::identity::Compatibility
+//! [`Compatibility`]: crate::security::identity::Compatibility
 //! [`ValueClass::min_compatibility`]: crate::cache::ValueClass::min_compatibility
 
 use super::entry::{Admitted, CacheEntry, CacheKey, Candidate, Demand, RejectReason, Sidecar};
-use crate::identity::ModelClass;
+use crate::security::identity::ModelClass;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -115,9 +115,9 @@ pub trait CacheRegistry: Send + Sync {
     async fn compatible_pools(
         &self,
         asker: &ModelClass,
-        min: crate::identity::Compatibility,
+        min: crate::security::identity::Compatibility,
     ) -> Result<Vec<Arc<dyn CachePool>>> {
-        let mut out: Vec<(crate::identity::Compatibility, Arc<dyn CachePool>)> = self
+        let mut out: Vec<(crate::security::identity::Compatibility, Arc<dyn CachePool>)> = self
             .pools()
             .await?
             .into_iter()

@@ -58,10 +58,10 @@ a persistent chat loop. That's the template for any consumer crate: add
 `ai-swarm = { path = "…" }` (or a git/version dep) and build on the traits.
 
 ### 3. Connect to OpenAI or Anthropic
-`crates/ai-swarm/src/remote.rs` provides `OpenAiModel` and `AnthropicModel`,
+`crates/ai-swarm/src/agent/remote.rs` provides `OpenAiModel` and `AnthropicModel`,
 both implementing `ModelProvider`, behind the `remote` feature (so the offline
 core stays dependency-light). The request/response mapping lives in
-`src/wire.rs` as pure functions and is unit-tested without any network.
+`src/agent/wire.rs` as pure functions and is unit-tested without any network.
 
 > Toolchain note: the `remote` feature pulls `reqwest`, whose current dependency
 > tree requires a recent stable Rust (edition 2024). The offline core, the demo,

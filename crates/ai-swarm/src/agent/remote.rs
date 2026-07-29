@@ -1,7 +1,7 @@
 //! Real network model providers (compiled only with `--features remote`).
 //!
 //! `AnthropicModel` and `OpenAiModel` implement `ModelProvider` by POSTing to
-//! each vendor's API. All the request/response *mapping* lives in `crate::wire`
+//! each vendor's API. All the request/response *mapping* lives in `super::wire`
 //! (pure, always compiled, unit-tested); this file is just the HTTP plumbing.
 //!
 //! NOTE: this module pulls in `reqwest`. Modern crates in that tree require a
@@ -9,9 +9,9 @@
 //! will not build on very old toolchains. The offline parts of the project do
 //! not depend on it.
 
-use crate::model::ModelProvider;
+use super::model::ModelProvider;
+use super::wire;
 use crate::types::{CompletionRequest, CompletionResponse};
-use crate::wire;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;

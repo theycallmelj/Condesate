@@ -3,14 +3,14 @@
 //! An `AgentLoop` drives an `Agent` to completion for one activation. Two impls
 //! are provided:
 //!   * `SingleShot` — think once, run any tools once, stop.
-//!   * `ReActLoop`  — think / act / observe until the agent stops calling tools
-//!                    (or a step budget is hit).
+//!   * `ReActLoop`  — think / act / observe until the agent stops calling
+//!     tools (or a step budget is hit).
 //!
 //! Because this is a trait, you can drop in tree-search, a debate loop, a
 //! human-in-the-loop gate, etc., without touching agents or harnesses.
 
-use crate::agent::{Agent, AgentContext};
-use crate::tool::Tool;
+use super::core::{Agent, AgentContext};
+use super::tool::Tool;
 use crate::types::{Message, ToolCall};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -31,6 +31,12 @@ pub trait AgentLoop: Send + Sync {
 }
 
 /// Execute every tool call in one assistant turn, appending observations.
+///
+/// Each call is authorized before it runs — `authorize_tool` is the call-time
+/// gate described in `crate::security::policy`, and it is checked here regardless of
+/// whether the model was ever shown the tool at advertise time. A denial does
+/// not error the loop out; it becomes a tool observation, same as any other
+/// tool failure, so the agent can see *why* and adapt.
 async fn execute_tools(
     calls: &[ToolCall],
     tools: &[Arc<dyn Tool>],
@@ -38,9 +44,12 @@ async fn execute_tools(
 ) -> Result<()> {
     for call in calls {
         let observation = match tools.iter().find(|t| t.spec().name == call.name) {
-            Some(tool) => match tool.call(call.args.clone(), &ctx.services).await {
-                Ok(out) => out,
-                Err(e) => format!("tool '{}' error: {e}", call.name),
+            Some(tool) => match ctx.services.authorize_tool(&call.name).await {
+                Ok(_obligations) => match tool.call(call.args.clone(), &ctx.services).await {
+                    Ok(out) => out,
+                    Err(e) => format!("tool '{}' error: {e}", call.name),
+                },
+                Err(refusal) => format!("tool '{}' denied: {refusal}", call.name),
             },
             None => format!("no such tool: '{}'", call.name),
         };
@@ -102,13 +111,19 @@ impl AgentLoop for ReActLoop {
 
 #[cfg(test)]
 mod tests {
+    use super::super::core::{AgentContext, BasicAgent};
+    use super::super::model::ModelProvider;
+    use super::super::tool::WordCount;
     use super::*;
-    use crate::agent::{AgentContext, BasicAgent};
-    use crate::bus::Bus;
-    use crate::model::ModelProvider;
-    use crate::service::ServiceHandle;
-    use crate::storage::InMemoryStorage;
-    use crate::tool::WordCount;
+    use crate::security::audit::{FixedClock, MemoryAudit};
+    use crate::security::identity::{ModelClass, TenantId, TrustTier};
+    use crate::security::kernel::{AgentManifest, Kernel};
+    use crate::security::policy::{
+        Action, GrantSet, Pattern, ResourcePattern, Rule, RuleSetPolicy, SubjectMatch,
+    };
+    use crate::swarm::bus::Bus;
+    use crate::swarm::service::ServiceHandle;
+    use crate::swarm::storage::InMemoryStorage;
     use crate::types::{CompletionRequest, CompletionResponse, HarnessId, Role, ToolCall};
     use anyhow::Result;
     use async_trait::async_trait;
@@ -139,14 +154,46 @@ mod tests {
         }
     }
 
+    /// A guarded context granting broad tool invocation, enough to exercise
+    /// loop control-flow without itself being a policy test.
     fn ctx() -> AgentContext {
-        let svc = ServiceHandle {
+        let raw = ServiceHandle {
             me: HarnessId::new("t"),
             roster: std::sync::Arc::new(vec![HarnessId::new("t")]),
             storage: InMemoryStorage::new(),
             bus: Bus::new(HashMap::new()),
         };
-        AgentContext::new(svc)
+        let requested = vec![Rule::allow(
+            "tools",
+            SubjectMatch::agent("t"),
+            &[Action::Invoke],
+            ResourcePattern::Tool(Pattern::Any),
+        )];
+        let kernel = Kernel::new(
+            GrantSet::new(requested.clone()),
+            std::sync::Arc::new(RuleSetPolicy::new()),
+            MemoryAudit::new(),
+            std::sync::Arc::new(FixedClock(0)),
+        );
+        let manifest = AgentManifest {
+            harness: HarnessId::new("t"),
+            agent: "t".into(),
+            model_class: ModelClass {
+                provider: "test".into(),
+                family: "test".into(),
+                revision: "test".into(),
+                embedding_space: None,
+                quantization: None,
+            },
+            tenant: TenantId::new("test"),
+            requested_trust: TrustTier::Privileged,
+            requested,
+            cache_classes: vec![],
+        };
+        let admission = kernel.admit(&manifest, None);
+        let svc = kernel.attach(&admission, raw);
+        svc.begin_activation("test", u64::MAX);
+        AgentContext::new(std::sync::Arc::new(svc))
     }
 
     fn agent() -> BasicAgent {
@@ -202,5 +249,56 @@ mod tests {
         let mut c = ctx();
         let out = ReActLoop { max_steps: 3 }.run(&a, &mut c).await.unwrap();
         assert_eq!(out.steps, 3);
+    }
+
+    #[tokio::test]
+    async fn an_unauthorized_tool_call_becomes_a_denied_observation_not_a_crash() {
+        // Same agent/tool as react_loop_runs_tool_then_stops, but the context
+        // holds no Invoke grant at all — the call-time gate in
+        // `execute_tools` should refuse the call and let the loop continue,
+        // not error the whole activation out.
+        let raw = ServiceHandle {
+            me: HarnessId::new("t"),
+            roster: std::sync::Arc::new(vec![HarnessId::new("t")]),
+            storage: InMemoryStorage::new(),
+            bus: Bus::new(HashMap::new()),
+        };
+        let kernel = Kernel::new(
+            GrantSet::default(),
+            std::sync::Arc::new(RuleSetPolicy::new()),
+            MemoryAudit::new(),
+            std::sync::Arc::new(FixedClock(0)),
+        );
+        let manifest = AgentManifest {
+            harness: HarnessId::new("t"),
+            agent: "t".into(),
+            model_class: ModelClass {
+                provider: "test".into(),
+                family: "test".into(),
+                revision: "test".into(),
+                embedding_space: None,
+                quantization: None,
+            },
+            tenant: TenantId::new("test"),
+            requested_trust: TrustTier::Privileged,
+            requested: vec![],
+            cache_classes: vec![],
+        };
+        let admission = kernel.admit(&manifest, None);
+        let svc = kernel.attach(&admission, raw);
+        svc.begin_activation("test", u64::MAX);
+        let mut c = AgentContext::new(std::sync::Arc::new(svc));
+
+        let a = agent();
+        let out = ReActLoop::default().run(&a, &mut c).await.unwrap();
+        assert_eq!(out.steps, 2, "the loop still completes rather than aborting");
+
+        let obs = c
+            .transcript
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .map(|m| m.content.clone())
+            .unwrap();
+        assert!(obs.contains("denied"), "{obs}");
     }
 }

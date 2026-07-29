@@ -1,6 +1,6 @@
 //! The kernel: setup, enforcement, and audit for the whole swarm.
 //!
-//! Everything in [`crate::policy`], [`crate::audit`], and [`crate::identity`] is
+//! Everything in [`super::policy`], [`super::audit`], and [`super::identity`] is
 //! inert data until something puts it in the path of a real call. That is this
 //! module. The kernel owns the boundary; agents and tools never touch it.
 //!
@@ -10,10 +10,12 @@
 //!   1. DECLARE   AgentManifest      what the agent says it needs
 //!   2. ADMIT     Kernel::admit      intersect with authority actually held
 //!                                   → Principal + GrantSet   (never a union)
-//!   3. ATTACH    Kernel::attach     wrap ServiceHandle → GuardedServices
-//!   4. ADVERTISE ToolBroker         the model is shown only permitted tools
+//!   3. ATTACH    Kernel::attach     wrap ServiceHandle → GuardedServices,
+//!                                   carrying the admitted GrantSet with it
+//!   4. ADVERTISE may_advertise      the model is shown only permitted tools
 //!   5. CALL      guarded syscall    tool or agent reaches for something
-//!   6. CHECK     PolicyEngine       Allow / Deny / Escalate (+ obligations)
+//!   6. CHECK     PolicyEngine       evaluated against *this* GrantSet
+//!                                   → Allow / Deny / Escalate (+ obligations)
 //!   7. RECORD    AuditSink          every outcome, allow and deny alike
 //!   8. EFFECT    inner service      only now does anything actually happen
 //!   9. REVOKE    Kernel::revoke     bump the epoch; live handles go stale
@@ -22,29 +24,28 @@
 //! Steps 6 and 7 are not optional and not reorderable. An effect that could not
 //! be audited does not run — see [`GuardedServices::check`].
 //!
+//! Step 6 is evaluated against the `GrantSet` computed at step 2, not against
+//! some separate swarm-wide rule list. That is what makes attenuation real:
+//! rules a manifest asked for and did not receive (see [`Admission::dropped`])
+//! are simply absent from what gets checked, not merely mismatched by a
+//! `SubjectMatch` pattern that happens to be looser elsewhere.
+//!
 //! ## Why the guard is here and not in the tools
 //!
-//! [`crate::tool::Tool`] implementations receive a service handle and can do
-//! whatever it permits. If each tool had to remember to check, the first tool
-//! written on a Friday would forget. Wrapping the handle instead means a tool
-//! *cannot* reach past the boundary — the unchecked methods are not on the
-//! object it holds.
-//!
-//! ## Status
-//!
-//! The check/audit path is real. The syscall wrappers delegate to
-//! [`crate::service::ServiceHandle`], which is not yet narrowed — until tools
-//! take a `&GuardedServices` instead of a `&ServiceHandle`, this is an
-//! *additional* gate rather than the only one.
+//! [`crate::agent::tool::Tool`] implementations receive a `&GuardedServices` and can
+//! do only what it permits — there is no raw `ServiceHandle` reachable from
+//! tool code. Wrapping the handle instead of trusting each tool to remember a
+//! check is what makes the boundary the *only* gate rather than an optional
+//! extra one.
 
-use crate::audit::{AuditEvent, AuditSink, Clock, Outcome, PrincipalRef};
-use crate::cache::{CacheRegistry, Candidate, Demand, ValueClass};
-use crate::identity::{Compatibility, GovernanceLabel, ModelClass, Principal, TenantId, TrustTier};
-use crate::policy::{
+use super::audit::{AuditEvent, AuditSink, Clock, Outcome, PrincipalRef};
+use super::identity::{Compatibility, GovernanceLabel, ModelClass, Principal, TenantId, TrustTier};
+use super::policy::{
     AccessRequest, Action, Approver, Decision, DenyReason, GrantSet, Obligation, PolicyEngine,
     RequestContext, Resource, Rule, RuleId,
 };
-use crate::service::ServiceHandle;
+use crate::cache::{CacheRegistry, Candidate, Demand, ValueClass};
+use crate::swarm::service::ServiceHandle;
 use crate::types::HarnessId;
 use anyhow::Result;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -103,7 +104,10 @@ impl std::error::Error for Refusal {}
 ///
 /// A manifest is a *request*, never a grant. Admission intersects it with the
 /// authority the spawner actually holds, so a manifest asking for the world
-/// produces a principal with nothing.
+/// produces a principal with nothing. This applies even at the top level: a
+/// manifest with no parent still attenuates against the kernel's root, so a
+/// harness that forgets to declare a rule it needs simply does not get it —
+/// there is no implicit "top-level agents get everything" path.
 #[derive(Clone, Debug)]
 pub struct AgentManifest {
     pub harness: HarnessId,
@@ -112,7 +116,9 @@ pub struct AgentManifest {
     pub tenant: TenantId,
     /// The tier the spawner is asking for. Capped at the spawner's own tier.
     pub requested_trust: TrustTier,
-    /// The rules the agent wants in force for itself.
+    /// The rules the agent wants in force for itself. Each must be covered —
+    /// resource, actions, *and* subject narrowing — by a rule the authority
+    /// above already holds; see [`super::policy::GrantSet::attenuate`].
     pub requested: Vec<Rule>,
     /// Cache classes this agent expects to read from. Recorded for review — a
     /// manifest that asks for a class it has no business in is a design smell
@@ -181,8 +187,8 @@ impl Kernel {
 
     /// Step 2: turn a manifest into a principal with attenuated authority.
     ///
-    /// `parent` is the spawner's grant set, or `None` for a top-level agent
-    /// admitted directly against the root.
+    /// `parent` is the spawner's admission, or `None` for a top-level agent
+    /// admitted directly against the kernel's root.
     pub fn admit(&self, manifest: &AgentManifest, parent: Option<&Admission>) -> Admission {
         let authority = parent.map(|p| &p.grants).unwrap_or(&self.root);
         let granted = authority.attenuate(&manifest.requested);
@@ -216,12 +222,14 @@ impl Kernel {
         }
     }
 
-    /// Step 3: wrap the raw syscall surface in the guard.
+    /// Step 3: wrap the raw syscall surface in the guard, carrying the
+    /// admitted `GrantSet` with it so every check evaluates against exactly
+    /// what this principal holds.
     pub fn attach(self: &Arc<Self>, admission: &Admission, inner: ServiceHandle) -> GuardedServices {
         GuardedServices {
             inner,
             principal: admission.principal.clone(),
-            held_epoch: admission.grants.epoch,
+            grants: admission.grants.clone(),
             kernel: self.clone(),
             activation: Mutex::new(String::from("boot")),
             steps: AtomicU32::new(0),
@@ -240,13 +248,17 @@ impl Kernel {
 
 /// What an agent and its tools actually hold.
 ///
-/// Every method is: build request → evaluate → audit → act. There is no method
-/// that skips the middle two.
+/// Every method is: build request → evaluate against `self.grants` → audit →
+/// act. There is no method that skips the middle two, and no raw
+/// `ServiceHandle` reachable from here except through [`Self::unguarded`],
+/// which exists only as a migration escape hatch.
 pub struct GuardedServices {
     inner: ServiceHandle,
     principal: Principal,
-    /// Epoch this handle was issued under. A revocation makes it stale.
-    held_epoch: u64,
+    /// The exact authority admitted for this principal — never the kernel's
+    /// full root, never a peer's. This is what [`Self::check`] evaluates
+    /// against.
+    grants: GrantSet,
     kernel: Arc<Kernel>,
     /// Correlation id for the message currently being handled.
     activation: Mutex<String>,
@@ -265,6 +277,13 @@ impl GuardedServices {
         *self.activation.lock().expect("activation lock") = id.into();
         self.steps.store(0, Ordering::SeqCst);
         self.byte_budget.store(byte_budget, Ordering::SeqCst);
+    }
+
+    /// Whether this principal's grants permit the model to even be told a
+    /// tool exists. Advertise-time filtering — see the module note on the two
+    /// enforcement points in [`super::policy`].
+    pub fn may_advertise(&self, tool: &str) -> bool {
+        self.kernel.policy.may_advertise(&self.grants, &self.principal, tool)
     }
 
     fn context(&self) -> RequestContext {
@@ -298,20 +317,18 @@ impl GuardedServices {
         ctx: RequestContext,
     ) -> std::result::Result<Vec<Obligation>, Refusal> {
         let current = self.kernel.epoch();
-        let decision = if current != self.held_epoch {
+        let decision = if current != self.grants.epoch {
             Decision::Deny {
                 rule: None,
-                reason: DenyReason::StaleEpoch { held: self.held_epoch, current },
+                reason: DenyReason::StaleEpoch { held: self.grants.epoch, current },
             }
         } else {
             self.kernel
                 .policy
-                .evaluate(&AccessRequest {
-                    principal: &self.principal,
-                    action,
-                    resource,
-                    context: &ctx,
-                })
+                .evaluate(
+                    &self.grants,
+                    &AccessRequest { principal: &self.principal, action, resource, context: &ctx },
+                )
                 .await
         };
 
@@ -409,8 +426,8 @@ impl GuardedServices {
     // -- tools --------------------------------------------------------------
 
     /// Call-time authorization for a tool. The authoritative gate;
-    /// [`crate::policy::ToolBroker`] only decides what the model gets *told*
-    /// about.
+    /// [`Self::may_advertise`] (and [`super::policy::ToolBroker`]) only decide
+    /// what the model gets *told* about.
     pub async fn authorize_tool(&self, name: &str) -> std::result::Result<Vec<Obligation>, Refusal> {
         self.steps.fetch_add(1, Ordering::SeqCst);
         self.check(Action::Invoke, &Resource::Tool { name: name.to_string() }).await
@@ -504,11 +521,11 @@ impl GuardedServices {
 
 #[cfg(test)]
 mod tests {
+    use super::super::audit::{FixedClock, MemoryAudit};
+    use super::super::policy::{Effect, Pattern, ResourcePattern, RuleSetPolicy, SubjectMatch};
     use super::*;
-    use crate::audit::{FixedClock, MemoryAudit};
-    use crate::bus::Bus;
-    use crate::policy::{Effect, Pattern, ResourcePattern, RuleSetPolicy, SubjectMatch};
-    use crate::storage::InMemoryStorage;
+    use crate::swarm::bus::Bus;
+    use crate::swarm::storage::InMemoryStorage;
     use std::collections::HashMap;
 
     fn class() -> ModelClass {
@@ -521,8 +538,9 @@ mod tests {
         }
     }
 
-    /// Root authority: scratch memory for everyone, peer messaging, and
-    /// shutdown for privileged agents only.
+    /// Root authority: scratch memory, peer messaging, and shutdown control
+    /// (privileged only) for anyone whose *requested* manifest rules match
+    /// this shape closely enough to be covered.
     fn root() -> GrantSet {
         GrantSet::new(vec![
             Rule::allow(
@@ -546,10 +564,10 @@ mod tests {
         ])
     }
 
-    fn kernel_with(grants: GrantSet) -> (Arc<Kernel>, Arc<MemoryAudit>) {
+    fn kernel_with(root_grants: GrantSet) -> (Arc<Kernel>, Arc<MemoryAudit>) {
         let audit = MemoryAudit::new();
-        let policy = Arc::new(RuleSetPolicy::new(grants));
-        let k = Kernel::new(root(), policy, audit.clone(), Arc::new(FixedClock(1_000)));
+        let policy = Arc::new(RuleSetPolicy::new());
+        let k = Kernel::new(root_grants, policy, audit.clone(), Arc::new(FixedClock(1_000)));
         (k, audit)
     }
 
@@ -572,6 +590,17 @@ mod tests {
             requested,
             cache_classes: vec![class()],
         }
+    }
+
+    /// A manifest requesting exactly the scratch-memory rule `root()` grants,
+    /// scoped to `agent`. The common case in these tests.
+    fn scratch_rw(agent: &str) -> Rule {
+        Rule::allow(
+            "w-mem",
+            SubjectMatch::agent(agent),
+            &[Action::Read, Action::Write],
+            ResourcePattern::Memory(Pattern::parse("scratch/*")),
+        )
     }
 
     #[tokio::test]
@@ -615,7 +644,7 @@ mod tests {
     #[tokio::test]
     async fn guarded_write_outside_the_grant_is_refused_and_audited() {
         let (kernel, audit) = kernel_with(root());
-        let adm = kernel.admit(&manifest("worker", TrustTier::Standard, vec![]), None);
+        let adm = kernel.admit(&manifest("worker", TrustTier::Standard, vec![scratch_rw("worker")]), None);
         let svc = kernel.attach(&adm, services("worker"));
         svc.begin_activation("act-1", 4096);
 
@@ -641,16 +670,41 @@ mod tests {
         let svc = kernel.attach(&worker, services("worker"));
         assert!(svc.broadcast_shutdown().await.is_err());
 
-        let planner = kernel.admit(&manifest("planner", TrustTier::Privileged, vec![]), None);
+        let planner_requested = vec![Rule::allow(
+            "p-control",
+            SubjectMatch { agent: Pattern::parse("planner"), min_trust: Some(TrustTier::Privileged), ..Default::default() },
+            &[Action::Control],
+            ResourcePattern::Swarm,
+        )];
+        let planner = kernel.admit(&manifest("planner", TrustTier::Privileged, planner_requested), None);
         let psvc = kernel.attach(&planner, services("planner"));
         // Permitted by policy; the empty bus makes the effect itself a no-op.
         assert!(psvc.check(Action::Control, &Resource::Swarm).await.is_ok());
     }
 
     #[tokio::test]
+    async fn a_dropped_trust_floor_cannot_be_used_at_call_time() {
+        // Mirrors policy::tests::attenuation_cannot_drop_a_parents_trust_floor,
+        // but exercised end to end through admit -> attach -> check, to prove
+        // the dropped rule is not just missing from `Admission::dropped` but
+        // genuinely unusable.
+        let (kernel, _) = kernel_with(root());
+        let requested = vec![Rule::allow(
+            "c-control",
+            SubjectMatch::agent("worker"), // no min_trust: cannot cover root's floor
+            &[Action::Control],
+            ResourcePattern::Swarm,
+        )];
+        let adm = kernel.admit(&manifest("worker", TrustTier::Privileged, requested), None);
+        assert!(adm.grants.rules.is_empty());
+        let svc = kernel.attach(&adm, services("worker"));
+        assert!(svc.check(Action::Control, &Resource::Swarm).await.is_err());
+    }
+
+    #[tokio::test]
     async fn revocation_makes_live_handles_stale() {
         let (kernel, audit) = kernel_with(root());
-        let adm = kernel.admit(&manifest("worker", TrustTier::Standard, vec![]), None);
+        let adm = kernel.admit(&manifest("worker", TrustTier::Standard, vec![scratch_rw("worker")]), None);
         let svc = kernel.attach(&adm, services("worker"));
         svc.begin_activation("act-1", 4096);
 
@@ -668,17 +722,15 @@ mod tests {
 
     #[tokio::test]
     async fn escalation_is_refused_but_named() {
-        let grants = GrantSet::new(vec![Rule {
+        let escalate_prod = |subject: SubjectMatch| Rule {
             effect: Effect::Escalate,
-            ..Rule::allow(
-                "ask-first",
-                SubjectMatch::default(),
-                &[Action::Write],
-                ResourcePattern::Memory(Pattern::parse("prod/*")),
-            )
-        }]);
-        let (kernel, _) = kernel_with(grants);
-        let adm = kernel.admit(&manifest("worker", TrustTier::Standard, vec![]), None);
+            ..Rule::allow("ask-first", subject, &[Action::Write], ResourcePattern::Memory(Pattern::parse("prod/*")))
+        };
+        let (kernel, _) = kernel_with(GrantSet::new(vec![escalate_prod(SubjectMatch::default())]));
+        let adm = kernel.admit(
+            &manifest("worker", TrustTier::Standard, vec![escalate_prod(SubjectMatch::agent("worker"))]),
+            None,
+        );
         let svc = kernel.attach(&adm, services("worker"));
 
         let refusal = svc
@@ -694,7 +746,7 @@ mod tests {
     #[tokio::test]
     async fn key_listing_hides_unreadable_keys() {
         let (kernel, _) = kernel_with(root());
-        let adm = kernel.admit(&manifest("worker", TrustTier::Standard, vec![]), None);
+        let adm = kernel.admit(&manifest("worker", TrustTier::Standard, vec![scratch_rw("worker")]), None);
         let svc = kernel.attach(&adm, services("worker"));
 
         // Seed through the raw handle: two readable, one not.

@@ -1,9 +1,10 @@
 //! The permission boundary: capabilities, rules, and decisions.
 //!
 //! This is the swarm's equivalent of an OS access-control layer. Every crossing
-//! of the syscall surface ([`crate::service::ServiceHandle`]) becomes an
+//! of the syscall surface ([`crate::swarm::service::ServiceHandle`]) becomes an
 //! [`AccessRequest`] — *subject, action, resource, context* — that a
-//! [`PolicyEngine`] turns into a [`Decision`].
+//! [`PolicyEngine`] turns into a [`Decision`], evaluated against one
+//! principal's own [`GrantSet`] (never a global set matched only by pattern).
 //!
 //! ## Three properties the model is built around
 //!
@@ -16,20 +17,32 @@
 //! 3. **Attenuation only.** A principal that spawns or delegates can hand over
 //!    a *subset* of its own authority and never more — see
 //!    [`GrantSet::attenuate`]. This is what stops a planner from bootstrapping
-//!    a worker with powers the planner does not itself hold.
+//!    a worker with powers the planner does not itself hold. The check is not
+//!    just "does the resource fit inside the parent's" — a requested rule must
+//!    also be at least as narrow *in who it matches* ([`SubjectMatch::contains`]).
+//!    Without that half, a child could drop a parent's `min_trust: Privileged`
+//!    restriction from its own copy of a rule and keep the rule anyway.
+//!
+//! Every admission — including a top-level one with no parent — attenuates
+//! against *some* authority (a parent's grants, or the kernel's root). There is
+//! no special case that hands a top-level agent the whole root unfiltered: a
+//! manifest declares copies of the specific rules it wants, shaped to match
+//! what the authority above it already allows. "Declare what you need" is
+//! enforced uniformly, not just for spawned children.
 //!
 //! ## Two enforcement points, on purpose
 //!
-//! * **Advertise time** — [`ToolBroker`] filters the toolbelt *before* the model
-//!   is told what exists. An agent cannot be talked into calling a tool it was
-//!   never shown, which shrinks the blast radius of prompt injection.
+//! * **Advertise time** — [`ToolBroker`] (or [`super::kernel::GuardedServices::may_advertise`])
+//!   filters the toolbelt *before* the model is told what exists. An agent
+//!   cannot be talked into calling a tool it was never shown, which shrinks the
+//!   blast radius of prompt injection.
 //! * **Call time** — the guarded service handle re-checks. This one is
 //!   authoritative; advertise-time filtering is only a reduction in temptation.
 //!
 //! Everything here is data plus one pure evaluator. Wiring it into the running
-//! harness is [`crate::kernel`]'s job.
+//! harness is [`super::kernel`]'s job.
 
-use crate::identity::{Compatibility, GovernanceLabel, ModelClass, Principal, TenantId, TrustTier};
+use super::identity::{Compatibility, GovernanceLabel, ModelClass, Principal, TenantId, TrustTier};
 use crate::types::HarnessId;
 use async_trait::async_trait;
 
@@ -265,6 +278,29 @@ impl SubjectMatch {
             && self.min_trust.is_none_or(|t| p.trust >= t)
             && self.model_class.as_ref().is_none_or(|m| m.matches(&p.model_class))
     }
+
+    /// Does `self` (a would-be parent rule's subject) match at least every
+    /// principal `other` (a requested rule's subject) would? The subject half
+    /// of attenuation containment — see the module-level note on why this
+    /// matters as much as [`ResourcePattern::contains`].
+    fn contains(&self, other: &SubjectMatch) -> bool {
+        let trust_ok = match self.min_trust {
+            None => true,
+            // A narrower-or-equal floor on the child's side is fine; a
+            // missing or lower floor would let the child's copy match
+            // principals the parent's rule never covered.
+            Some(parent_floor) => other.min_trust.is_some_and(|c| c >= parent_floor),
+        };
+        let tenant_ok = match &self.tenant {
+            None => true,
+            Some(t) => other.tenant.as_ref() == Some(t),
+        };
+        let class_ok = match &self.model_class {
+            None => true,
+            Some(p) => other.model_class.as_ref().is_some_and(|c| p.contains(c)),
+        };
+        self.agent.contains(&other.agent) && tenant_ok && trust_ok && class_ok
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -394,9 +430,16 @@ impl Rule {
             && self.resource.matches(req.resource)
     }
 
-    /// Would `self` permit at least everything `other` permits?
+    /// Would `self` permit at least everything `other` permits? Requires
+    /// containment on *both* halves of the rule — the resource it reaches and
+    /// the subject it matches — plus every action `other` claims. Checking
+    /// resource alone is not enough: a parent rule scoped to
+    /// `min_trust: Privileged` does not cover a child's copy of the same rule
+    /// with the trust floor dropped, even though the resource and actions
+    /// match exactly.
     fn covers(&self, other: &Rule) -> bool {
         self.effect == Effect::Allow
+            && self.subject.contains(&other.subject)
             && other.actions.iter().all(|a| self.actions.contains(a))
             && self.resource.contains(&other.resource)
     }
@@ -405,9 +448,10 @@ impl Rule {
 /// The set of rules in force for one principal, plus the epoch that makes
 /// revocation possible.
 ///
-/// Held by the kernel, never by the agent. Bumping [`GrantSet::epoch`] via the
-/// kernel invalidates every handle issued under the old epoch, which is how a
-/// misbehaving agent is defanged without killing it mid-write.
+/// Held by the kernel, never by the agent. Bumping the kernel's epoch via
+/// [`super::kernel::Kernel::revoke_all`] invalidates every handle issued under
+/// the old epoch, which is how a misbehaving agent is defanged without killing
+/// it mid-write.
 #[derive(Clone, Debug, Default)]
 pub struct GrantSet {
     pub rules: Vec<Rule>,
@@ -429,10 +473,22 @@ impl GrantSet {
 
     /// Delegate a subset of this authority to a child.
     ///
-    /// A requested allow survives only if some allow already in this set covers
-    /// it. Every denial in this set is inherited unconditionally — a parent
-    /// cannot delegate away a restriction it is itself under. This is the
-    /// no-escalation-by-spawning rule.
+    /// A requested allow survives only if some allow already in this set
+    /// covers it *including* its subject narrowing (see [`Rule::covers`]).
+    /// Every denial in this set is inherited unconditionally — a parent cannot
+    /// delegate away a restriction it is itself under. This is the
+    /// no-escalation-by-spawning rule, and it applies uniformly: a top-level
+    /// admission attenuates against the kernel's root the same way a spawned
+    /// child attenuates against its parent. There is no unfiltered path.
+    ///
+    /// `Escalate` and `Deny` requests are kept as asked, without a coverage
+    /// check — both only ever narrow what a principal may do (an escalation
+    /// still requires approval; a denial only restricts), so free-adding them
+    /// cannot itself grant reach the authority above did not already gate in
+    /// some way. This is a deliberate scope boundary, not an oversight: it
+    /// does mean a child can mint an `Escalate` rule for a resource its parent
+    /// never mentioned at all, which is a softer guarantee than the `Allow`
+    /// path gets. Tightening that is tracked as a follow-up, not done here.
     pub fn attenuate(&self, requested: &[Rule]) -> GrantSet {
         let mut out: Vec<Rule> = self
             .rules
@@ -443,7 +499,6 @@ impl GrantSet {
 
         for want in requested {
             match want.effect {
-                // A child may always be *more* restricted than asked.
                 Effect::Deny | Effect::Escalate => out.push(want.clone()),
                 Effect::Allow => {
                     if self.rules.iter().any(|mine| mine.covers(want)) {
@@ -534,41 +589,48 @@ impl Decision {
 // The engine
 // ---------------------------------------------------------------------------
 
-/// Turns requests into decisions.
+/// Turns requests into decisions against a specific principal's [`GrantSet`].
+///
+/// The grant set is passed in per call rather than fixed at construction: one
+/// engine instance serves every principal in the swarm, each evaluated against
+/// its own attenuated authority, never a shared global set matched only by
+/// [`SubjectMatch`] pattern.
 ///
 /// Async because a real deployment may consult a remote decision point or a
 /// human approver. [`RuleSetPolicy`] is the local, pure implementation.
 #[async_trait]
 pub trait PolicyEngine: Send + Sync {
-    async fn evaluate(&self, req: &AccessRequest<'_>) -> Decision;
+    async fn evaluate(&self, grants: &GrantSet, req: &AccessRequest<'_>) -> Decision;
 
     /// Cheap synchronous pre-filter for advertise-time tool listing. Defaults
     /// to permissive so the authoritative async check stays the only gate that
     /// matters; override it to shrink what the model is shown.
-    fn may_advertise(&self, _principal: &Principal, _tool: &str) -> bool {
+    fn may_advertise(&self, _grants: &GrantSet, _principal: &Principal, _tool: &str) -> bool {
         true
     }
 }
 
-/// The reference engine: evaluate a [`GrantSet`] with deny-wins precedence.
+/// The reference engine: deny-wins evaluation of whatever [`GrantSet`] it is
+/// handed.
 pub struct RuleSetPolicy {
-    grants: GrantSet,
     /// Where escalations are routed when a rule says `Effect::Escalate`.
     pub approver: Approver,
 }
 
+impl Default for RuleSetPolicy {
+    fn default() -> Self {
+        Self { approver: Approver::Operator }
+    }
+}
+
 impl RuleSetPolicy {
-    pub fn new(grants: GrantSet) -> Self {
-        Self { grants, approver: Approver::Operator }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn with_approver(mut self, approver: Approver) -> Self {
         self.approver = approver;
         self
-    }
-
-    pub fn grants(&self) -> &GrantSet {
-        &self.grants
     }
 
     /// Evaluate a condition against the request. Unknown/absent context fails
@@ -603,7 +665,7 @@ fn label_of(resource: &Resource) -> Option<&GovernanceLabel> {
 
 #[async_trait]
 impl PolicyEngine for RuleSetPolicy {
-    async fn evaluate(&self, req: &AccessRequest<'_>) -> Decision {
+    async fn evaluate(&self, grants: &GrantSet, req: &AccessRequest<'_>) -> Decision {
         // Structural isolation first — no rule can grant across tenants.
         if let Resource::Cache { label: Some(l), .. } = req.resource {
             if !l.could_flow_to(req.principal) {
@@ -622,7 +684,7 @@ impl PolicyEngine for RuleSetPolicy {
         let mut obligations: Vec<Obligation> = Vec::new();
         let mut failed_condition: Option<(&Rule, &Condition)> = None;
 
-        for rule in &self.grants.rules {
+        for rule in &grants.rules {
             if !rule.applies(req) {
                 continue;
             }
@@ -668,10 +730,10 @@ impl PolicyEngine for RuleSetPolicy {
         Decision::unmatched()
     }
 
-    fn may_advertise(&self, principal: &Principal, tool: &str) -> bool {
+    fn may_advertise(&self, grants: &GrantSet, principal: &Principal, tool: &str) -> bool {
         let resource = Resource::Tool { name: tool.to_string() };
         let mut seen_allow = false;
-        for rule in &self.grants.rules {
+        for rule in &grants.rules {
             if !rule.subject.matches(principal)
                 || !rule.actions.contains(&Action::Invoke)
                 || !rule.resource.matches(&resource)
@@ -694,33 +756,36 @@ impl PolicyEngine for RuleSetPolicy {
 /// Narrows a toolbelt to what a principal may actually invoke, before the model
 /// is told the tools exist.
 ///
-/// Wrapping an [`crate::agent::Agent`] in a broker is the intended integration:
-/// the broker owns the full belt, the agent only ever sees the filtered view.
+/// [`super::kernel::GuardedServices::may_advertise`] is the equivalent
+/// convenience for code that already holds a live guarded handle; this type is
+/// for building a filtered view without one (e.g. listing a principal's
+/// available tools for a UI).
 pub struct ToolBroker {
     pub principal: Principal,
+    pub grants: GrantSet,
     pub policy: std::sync::Arc<dyn PolicyEngine>,
 }
 
 impl ToolBroker {
-    pub fn new(principal: Principal, policy: std::sync::Arc<dyn PolicyEngine>) -> Self {
-        Self { principal, policy }
+    pub fn new(principal: Principal, grants: GrantSet, policy: std::sync::Arc<dyn PolicyEngine>) -> Self {
+        Self { principal, grants, policy }
     }
 
     /// The subset of `all` this principal may be shown.
     pub fn visible<'a>(
         &self,
-        all: &'a [std::sync::Arc<dyn crate::tool::Tool>],
-    ) -> Vec<&'a std::sync::Arc<dyn crate::tool::Tool>> {
+        all: &'a [std::sync::Arc<dyn crate::agent::tool::Tool>],
+    ) -> Vec<&'a std::sync::Arc<dyn crate::agent::tool::Tool>> {
         all.iter()
-            .filter(|t| self.policy.may_advertise(&self.principal, &t.spec().name))
+            .filter(|t| self.policy.may_advertise(&self.grants, &self.principal, &t.spec().name))
             .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::identity::TenantId;
     use super::*;
-    use crate::identity::TenantId;
 
     fn class() -> ModelClass {
         ModelClass {
@@ -743,18 +808,26 @@ mod tests {
         }
     }
 
-    async fn decide(policy: &RuleSetPolicy, p: &Principal, a: Action, r: &Resource) -> Decision {
+    async fn decide(
+        policy: &RuleSetPolicy,
+        grants: &GrantSet,
+        p: &Principal,
+        a: Action,
+        r: &Resource,
+    ) -> Decision {
         let ctx = RequestContext::default();
         policy
-            .evaluate(&AccessRequest { principal: p, action: a, resource: r, context: &ctx })
+            .evaluate(grants, &AccessRequest { principal: p, action: a, resource: r, context: &ctx })
             .await
     }
 
     #[tokio::test]
     async fn unmatched_request_is_denied() {
-        let policy = RuleSetPolicy::new(GrantSet::default());
+        let policy = RuleSetPolicy::new();
+        let grants = GrantSet::default();
         let p = principal("worker", TrustTier::Standard);
-        let d = decide(&policy, &p, Action::Invoke, &Resource::Tool { name: "rm".into() }).await;
+        let d = decide(&policy, &grants, &p, Action::Invoke, &Resource::Tool { name: "rm".into() })
+            .await;
         assert_eq!(d, Decision::Deny { rule: None, reason: DenyReason::NoMatchingRule });
     }
 
@@ -775,11 +848,13 @@ mod tests {
             ),
         ];
         let p = principal("worker", TrustTier::Standard);
+        let policy = RuleSetPolicy::new();
 
         for order in [rules.clone(), rules.into_iter().rev().collect()] {
-            let policy = RuleSetPolicy::new(GrantSet::new(order));
+            let grants = GrantSet::new(order);
             let d = decide(
                 &policy,
+                &grants,
                 &p,
                 Action::Invoke,
                 &Resource::Tool { name: "shutdown_swarm".into() },
@@ -790,54 +865,62 @@ mod tests {
                 Decision::Deny { reason: DenyReason::ExplicitDeny, .. }
             ));
             // ...while an unrelated tool still passes.
-            let ok =
-                decide(&policy, &p, Action::Invoke, &Resource::Tool { name: "word_count".into() })
-                    .await;
+            let ok = decide(
+                &policy,
+                &grants,
+                &p,
+                Action::Invoke,
+                &Resource::Tool { name: "word_count".into() },
+            )
+            .await;
             assert!(ok.is_allow());
         }
     }
 
     #[tokio::test]
     async fn memory_prefix_scopes_the_address_space() {
-        let policy = RuleSetPolicy::new(GrantSet::new(vec![Rule::allow(
+        let policy = RuleSetPolicy::new();
+        let grants = GrantSet::new(vec![Rule::allow(
             "own-scratch",
             SubjectMatch::agent("worker"),
             &[Action::Read, Action::Write],
             ResourcePattern::Memory(Pattern::parse("scratch/worker/*")),
-        )]));
+        )]);
         let p = principal("worker", TrustTier::Standard);
 
         let mine = Resource::Memory { key: "scratch/worker/notes".into() };
-        assert!(decide(&policy, &p, Action::Write, &mine).await.is_allow());
+        assert!(decide(&policy, &grants, &p, Action::Write, &mine).await.is_allow());
 
         let theirs = Resource::Memory { key: "scratch/planner/notes".into() };
-        assert!(!decide(&policy, &p, Action::Write, &theirs).await.is_allow());
+        assert!(!decide(&policy, &grants, &p, Action::Write, &theirs).await.is_allow());
     }
 
     #[tokio::test]
     async fn min_trust_gates_swarm_control() {
-        let policy = RuleSetPolicy::new(GrantSet::new(vec![Rule::allow(
+        let policy = RuleSetPolicy::new();
+        let grants = GrantSet::new(vec![Rule::allow(
             "privileged-shutdown",
             SubjectMatch { min_trust: Some(TrustTier::Privileged), ..Default::default() },
             &[Action::Control],
             ResourcePattern::Swarm,
-        )]));
+        )]);
 
         let planner = principal("planner", TrustTier::Privileged);
         let worker = principal("worker", TrustTier::Sandboxed);
-        assert!(decide(&policy, &planner, Action::Control, &Resource::Swarm).await.is_allow());
-        assert!(!decide(&policy, &worker, Action::Control, &Resource::Swarm).await.is_allow());
+        assert!(decide(&policy, &grants, &planner, Action::Control, &Resource::Swarm).await.is_allow());
+        assert!(!decide(&policy, &grants, &worker, Action::Control, &Resource::Swarm).await.is_allow());
     }
 
     #[tokio::test]
     async fn cross_tenant_cache_read_is_structurally_denied() {
         // Even a wide-open allow cannot move a value across tenants.
-        let policy = RuleSetPolicy::new(GrantSet::new(vec![Rule::allow(
+        let policy = RuleSetPolicy::new();
+        let grants = GrantSet::new(vec![Rule::allow(
             "everything",
             SubjectMatch::default(),
             &[Action::Read],
             ResourcePattern::AnyResource,
-        )]));
+        )]);
         let p = principal("worker", TrustTier::Privileged);
         let foreign = Resource::Cache {
             class: class(),
@@ -845,14 +928,15 @@ mod tests {
             label: Some(GovernanceLabel::plain(TenantId::new("other-corp"))),
         };
         assert!(matches!(
-            decide(&policy, &p, Action::Read, &foreign).await,
+            decide(&policy, &grants, &p, Action::Read, &foreign).await,
             Decision::Deny { reason: DenyReason::Isolation(_), .. }
         ));
     }
 
     #[tokio::test]
     async fn condition_failure_reports_the_rule_that_nearly_matched() {
-        let policy = RuleSetPolicy::new(GrantSet::new(vec![Rule::allow(
+        let policy = RuleSetPolicy::new();
+        let grants = GrantSet::new(vec![Rule::allow(
             "kv-blocks-need-identical-model",
             SubjectMatch::default(),
             &[Action::Pull],
@@ -861,7 +945,7 @@ mod tests {
                 value_class: Some(crate::cache::ValueClass::KvBlock),
             },
         )
-        .with_conditions(vec![Condition::MinCompatibility(Compatibility::Identical)])]));
+        .with_conditions(vec![Condition::MinCompatibility(Compatibility::Identical)])]);
 
         let p = principal("worker", TrustTier::Standard);
         let resource = Resource::Cache {
@@ -874,7 +958,7 @@ mod tests {
             ..Default::default()
         };
         let d = policy
-            .evaluate(&AccessRequest {
+            .evaluate(&grants, &AccessRequest {
                 principal: &p,
                 action: Action::Pull,
                 resource: &resource,
@@ -936,6 +1020,28 @@ mod tests {
     }
 
     #[test]
+    fn attenuation_cannot_drop_a_parents_trust_floor() {
+        // The parent only grants Control to Privileged principals. A child
+        // requesting the same action+resource but omitting that floor must
+        // not receive the rule just because the resource matched.
+        let parent = GrantSet::new(vec![Rule::allow(
+            "p-control",
+            SubjectMatch { min_trust: Some(TrustTier::Privileged), ..Default::default() },
+            &[Action::Control],
+            ResourcePattern::Swarm,
+        )]);
+
+        let child = parent.attenuate(&[Rule::allow(
+            "c-control",
+            SubjectMatch::agent("worker"),
+            &[Action::Control],
+            ResourcePattern::Swarm,
+        )]);
+
+        assert!(child.rules.is_empty(), "dropping the parent's trust floor must not be grantable");
+    }
+
+    #[test]
     fn pattern_containment() {
         let any = Pattern::Any;
         let pre = Pattern::parse("proj/*");
@@ -948,7 +1054,8 @@ mod tests {
 
     #[test]
     fn advertise_filter_hides_denied_tools() {
-        let policy = RuleSetPolicy::new(GrantSet::new(vec![
+        let policy = RuleSetPolicy::new();
+        let grants = GrantSet::new(vec![
             Rule::allow(
                 "tools",
                 SubjectMatch::default(),
@@ -961,9 +1068,9 @@ mod tests {
                 &[Action::Invoke],
                 ResourcePattern::Tool(Pattern::Exact("shutdown_swarm".into())),
             ),
-        ]));
+        ]);
         let p = principal("worker", TrustTier::Standard);
-        assert!(policy.may_advertise(&p, "word_count"));
-        assert!(!policy.may_advertise(&p, "shutdown_swarm"));
+        assert!(policy.may_advertise(&grants, &p, "word_count"));
+        assert!(!policy.may_advertise(&grants, &p, "shutdown_swarm"));
     }
 }

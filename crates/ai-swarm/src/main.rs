@@ -14,19 +14,137 @@
 use std::sync::Arc;
 
 use ai_swarm::{
-    Agent, BasicAgent, CloudModel, LocalModel, ReActLoop, Remember, SendMessage, ShutdownSwarm,
-    StandardHarness, Storage, Swarm, Tool, WordCount,
+    Action, Agent, AgentManifest, BasicAgent, CloudModel, GrantSet, HarnessId, Kernel, LocalModel,
+    MemoryAudit, ModelClass, Pattern, ReActLoop, Remember, ResourcePattern, Rule, RuleSetPolicy,
+    SendMessage, ShutdownSwarm, StandardHarness, Storage, SubjectMatch, Swarm, SystemClock,
+    TenantId, Tool, TrustTier, WordCount,
 };
 
 fn boxed_agent(a: BasicAgent) -> Box<dyn Agent> {
     Box::new(a)
 }
 
+/// A stand-in model class: the demo's mocks aren't a real serving revision, so
+/// this is just what every harness here declares itself as for cache-pool and
+/// audit purposes.
+fn mock_class() -> ModelClass {
+    ModelClass {
+        provider: "mock".into(),
+        family: "mock".into(),
+        revision: "mock".into(),
+        embedding_space: None,
+        quantization: None,
+    }
+}
+
+/// The swarm operator's root authority: everything a harness in this demo may
+/// ever hold, before any manifest narrows it further. Memory is scoped per
+/// harness (`scratch/<id>/*`) plus a shared results namespace both may write;
+/// messaging and tool invocation are open; shutdown requires `Privileged`.
+fn root_grants() -> GrantSet {
+    GrantSet::new(vec![
+        Rule::allow(
+            "mem-scratch",
+            SubjectMatch::default(),
+            &[Action::Read, Action::Write],
+            ResourcePattern::Memory(Pattern::parse("scratch/*")),
+        ),
+        Rule::allow(
+            "mem-shared",
+            SubjectMatch::default(),
+            &[Action::Read, Action::Write],
+            ResourcePattern::Memory(Pattern::parse("slogan/*")),
+        ),
+        Rule::allow(
+            "talk",
+            SubjectMatch::default(),
+            &[Action::Send],
+            ResourcePattern::Peer(Pattern::Any),
+        ),
+        Rule::allow(
+            "tools",
+            SubjectMatch::default(),
+            &[Action::Invoke],
+            ResourcePattern::Tool(Pattern::Any),
+        ),
+        Rule::allow(
+            "shutdown",
+            SubjectMatch { min_trust: Some(TrustTier::Privileged), ..Default::default() },
+            &[Action::Control],
+            ResourcePattern::Swarm,
+        ),
+    ])
+}
+
+/// A manifest requesting the subset of `root_grants()` this demo's harnesses
+/// need, scoped to `agent`. Every manifest must declare rules that are
+/// actually covered by the authority above it — see `AgentManifest`'s docs —
+/// there is no implicit "top-level agents get everything" path.
+fn manifest(harness: &str, agent: &str, trust: TrustTier, needs_control: bool) -> AgentManifest {
+    // Requested rules must be covered *exactly enough* by root_grants(): a
+    // request for `Memory(Any)` would not be contained by root's narrower
+    // `scratch/*` / `slogan/*` prefixes, so it mirrors their shape instead of
+    // asking for the world and hoping.
+    let mut requested = vec![
+        Rule::allow(
+            "mem-scratch",
+            SubjectMatch::agent(agent),
+            &[Action::Read, Action::Write],
+            ResourcePattern::Memory(Pattern::parse("scratch/*")),
+        ),
+        Rule::allow(
+            "mem-shared",
+            SubjectMatch::agent(agent),
+            &[Action::Read, Action::Write],
+            ResourcePattern::Memory(Pattern::parse("slogan/*")),
+        ),
+        Rule::allow(
+            "talk",
+            SubjectMatch::agent(agent),
+            &[Action::Send],
+            ResourcePattern::Peer(Pattern::Any),
+        ),
+        Rule::allow(
+            "tools",
+            SubjectMatch::agent(agent),
+            &[Action::Invoke],
+            ResourcePattern::Tool(Pattern::Any),
+        ),
+    ];
+    if needs_control {
+        requested.push(Rule::allow(
+            "control",
+            SubjectMatch {
+                agent: Pattern::parse(agent),
+                min_trust: Some(TrustTier::Privileged),
+                ..Default::default()
+            },
+            &[Action::Control],
+            ResourcePattern::Swarm,
+        ));
+    }
+    AgentManifest {
+        harness: HarnessId::new(harness),
+        agent: agent.to_string(),
+        model_class: mock_class(),
+        tenant: TenantId::new("demo"),
+        requested_trust: trust,
+        requested,
+        cache_classes: vec![],
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // --- shared services --------------------------------------------------
     let storage = ai_swarm::InMemoryStorage::new();
-    let mut swarm = Swarm::new(storage.clone());
+    let kernel = Kernel::new(
+        root_grants(),
+        Arc::new(RuleSetPolicy::new()),
+        MemoryAudit::new(),
+        Arc::new(SystemClock),
+    );
+    let mut swarm = Swarm::new(storage.clone(), kernel);
 
     // --- worker: LOCAL model ---------------------------------------------
     let worker_tools: Vec<Arc<dyn Tool>> =
@@ -63,8 +181,11 @@ async fn main() -> anyhow::Result<()> {
     .with_seed("Analyze the slogan 'ship fast stay safe' and record a verdict.");
 
     // Registration order doesn't matter; the bus is fully wired before boot.
-    swarm.register(Box::new(worker));
-    swarm.register(Box::new(planner));
+    swarm.register(Box::new(worker), manifest("worker-local", "worker", TrustTier::Standard, false));
+    swarm.register(
+        Box::new(planner),
+        manifest("planner-cloud", "planner", TrustTier::Privileged, true),
+    );
 
     // --- run to completion ------------------------------------------------
     swarm.run().await?;

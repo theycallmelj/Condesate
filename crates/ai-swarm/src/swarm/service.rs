@@ -5,8 +5,8 @@
 //! storage. Agents and tools reach the outside world only through this handle,
 //! which keeps them decoupled from the swarm's internals.
 
-use crate::bus::{Bus, Envelope, Payload, Recipient};
-use crate::storage::Storage;
+use super::bus::{Bus, Envelope, Payload, Recipient};
+use super::storage::Storage;
 use crate::types::HarnessId;
 use anyhow::Result;
 use std::sync::Arc;

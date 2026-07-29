@@ -17,8 +17,10 @@ use std::io::Write;
 use std::sync::Arc;
 
 use ai_swarm::{
-    Agent, AgentContext, AgentLoop, BasicAgent, Bus, CompletionRequest, CompletionResponse,
-    HarnessId, Message, ModelProvider, Role, ServiceHandle, SingleShot, Storage,
+    Agent, AgentContext, AgentLoop, AgentManifest, BasicAgent, Bus, CompletionRequest,
+    CompletionResponse, GrantSet, HarnessId, Kernel, MemoryAudit, Message, ModelClass,
+    ModelProvider, Role, RuleSetPolicy, ServiceHandle, SingleShot, Storage, SystemClock, TenantId,
+    TrustTier,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -108,14 +110,42 @@ fn choose_provider() -> Arc<dyn ModelProvider> {
     Arc::new(EchoModel)
 }
 
-/// Build a minimal `ServiceHandle` (chat needs no bus peers or storage).
-fn solo_services() -> ServiceHandle {
-    ServiceHandle {
+/// Build a minimal guarded handle for the solo chat harness. The basic chat
+/// flow calls no tools and touches no shared storage, so the manifest asks for
+/// nothing beyond existing — every real syscall would still be denied and
+/// audited, same as any other principal in the swarm.
+fn solo_services() -> Arc<ai_swarm::GuardedServices> {
+    let raw = ServiceHandle {
         me: HarnessId::new("chat"),
         roster: Arc::new(vec![HarnessId::new("chat")]),
         storage: Arc::new(NullStorage),
         bus: Bus::new(std::collections::HashMap::new()),
-    }
+    };
+    let kernel = Kernel::new(
+        GrantSet::default(),
+        Arc::new(RuleSetPolicy::new()),
+        MemoryAudit::new(),
+        Arc::new(SystemClock),
+    );
+    let manifest = AgentManifest {
+        harness: HarnessId::new("chat"),
+        agent: "assistant".into(),
+        model_class: ModelClass {
+            provider: "chat-app".into(),
+            family: "chat-app".into(),
+            revision: "chat-app".into(),
+            embedding_space: None,
+            quantization: None,
+        },
+        tenant: TenantId::new("local"),
+        requested_trust: TrustTier::Standard,
+        requested: vec![],
+        cache_classes: vec![],
+    };
+    let admission = kernel.admit(&manifest, None);
+    let services = kernel.attach(&admission, raw);
+    services.begin_activation("chat", 0);
+    Arc::new(services)
 }
 
 #[tokio::main]

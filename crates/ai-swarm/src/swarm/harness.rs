@@ -8,15 +8,18 @@
 //!
 //! `Harness` is a trait so you can implement radically different runtimes
 //! (batch, cron-driven, streaming, a REPL, ...) and still register them in the
-//! same swarm.
+//! same swarm. Every implementation runs against a `GuardedServices`, not a
+//! raw `ServiceHandle` — the swarm admits each harness through a `Kernel`
+//! before spawning it, so there is no runtime path that reaches a tool or a
+//! peer without going through the permission boundary.
 
-use crate::agent::{Agent, AgentContext};
-use crate::bus::{Envelope, Inbox, Payload};
-use crate::loops::AgentLoop;
-use crate::service::ServiceHandle;
+use super::bus::{Envelope, Inbox, Payload};
+use crate::agent::{Agent, AgentContext, AgentLoop};
+use crate::security::kernel::GuardedServices;
 use crate::types::{HarnessId, Message};
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::Arc;
 
 #[async_trait]
 pub trait Harness: Send + Sync {
@@ -24,7 +27,7 @@ pub trait Harness: Send + Sync {
     /// The swarm injects this harness's inbox before spawning it.
     fn install_inbox(&mut self, inbox: Inbox);
     /// Run until shutdown. Consumes the injected inbox internally.
-    async fn run(&mut self, services: ServiceHandle) -> Result<()>;
+    async fn run(&mut self, services: Arc<GuardedServices>) -> Result<()>;
 }
 
 /// Default harness implementation.
@@ -34,6 +37,12 @@ pub struct StandardHarness {
     agent_loop: Box<dyn AgentLoop>,
     seed: Option<String>,
     inbox: Option<Inbox>,
+    /// Incremented per activation, so every audit correlation id is unique
+    /// even across many messages to the same harness.
+    activation_seq: u64,
+    /// Byte budget handed to `GuardedServices::begin_activation` each round —
+    /// the planning-round cap a cache-pull policy condition can check against.
+    byte_budget: u64,
 }
 
 impl StandardHarness {
@@ -48,6 +57,8 @@ impl StandardHarness {
             agent_loop,
             seed: None,
             inbox: None,
+            activation_seq: 0,
+            byte_budget: 64 * 1024 * 1024,
         }
     }
 
@@ -57,8 +68,17 @@ impl StandardHarness {
         self
     }
 
+    /// Override the default per-activation byte budget.
+    pub fn with_byte_budget(mut self, bytes: u64) -> Self {
+        self.byte_budget = bytes;
+        self
+    }
+
     /// Run the agent loop once over a single inbound text, fresh transcript.
-    async fn activate(&self, text: &str, services: &ServiceHandle) -> Result<()> {
+    async fn activate(&mut self, text: &str, services: &Arc<GuardedServices>) -> Result<()> {
+        self.activation_seq += 1;
+        services.begin_activation(format!("{}-{}", self.id, self.activation_seq), self.byte_budget);
+
         println!("  ┌─ {} activated: {text}", self.id);
         let mut ctx = AgentContext::new(services.clone());
         ctx.transcript.push(Message::user(text.to_string()));
@@ -81,7 +101,7 @@ impl Harness for StandardHarness {
         self.inbox = Some(inbox);
     }
 
-    async fn run(&mut self, services: ServiceHandle) -> Result<()> {
+    async fn run(&mut self, services: Arc<GuardedServices>) -> Result<()> {
         let mut inbox = self
             .inbox
             .take()

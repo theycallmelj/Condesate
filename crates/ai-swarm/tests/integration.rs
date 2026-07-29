@@ -7,12 +7,103 @@
 use std::sync::Arc;
 
 use ai_swarm::{
-    Agent, BasicAgent, CloudModel, InMemoryStorage, LocalModel, ReActLoop, Remember, SendMessage,
-    ShutdownSwarm, StandardHarness, Storage, Swarm, Tool, WordCount,
+    Action, Agent, AgentManifest, BasicAgent, CloudModel, GrantSet, HarnessId, InMemoryStorage,
+    Kernel, LocalModel, MemoryAudit, ModelClass, Pattern, ReActLoop, Remember, ResourcePattern,
+    Rule, RuleSetPolicy, SendMessage, ShutdownSwarm, StandardHarness, Storage, SubjectMatch,
+    Swarm, SystemClock, TenantId, Tool, TrustTier, WordCount,
 };
 
+fn mock_class() -> ModelClass {
+    ModelClass {
+        provider: "mock".into(),
+        family: "mock".into(),
+        revision: "mock".into(),
+        embedding_space: None,
+        quantization: None,
+    }
+}
+
+fn root_grants() -> GrantSet {
+    GrantSet::new(vec![
+        Rule::allow(
+            "mem",
+            SubjectMatch::default(),
+            &[Action::Read, Action::Write],
+            ResourcePattern::Memory(Pattern::parse("slogan/*")),
+        ),
+        Rule::allow(
+            "talk",
+            SubjectMatch::default(),
+            &[Action::Send],
+            ResourcePattern::Peer(Pattern::Any),
+        ),
+        Rule::allow(
+            "tools",
+            SubjectMatch::default(),
+            &[Action::Invoke],
+            ResourcePattern::Tool(Pattern::Any),
+        ),
+        Rule::allow(
+            "shutdown",
+            SubjectMatch { min_trust: Some(TrustTier::Privileged), ..Default::default() },
+            &[Action::Control],
+            ResourcePattern::Swarm,
+        ),
+    ])
+}
+
+fn manifest(harness: &str, agent: &str, trust: TrustTier, needs_control: bool) -> AgentManifest {
+    let mut requested = vec![
+        Rule::allow(
+            "mem",
+            SubjectMatch::agent(agent),
+            &[Action::Read, Action::Write],
+            ResourcePattern::Memory(Pattern::parse("slogan/*")),
+        ),
+        Rule::allow(
+            "talk",
+            SubjectMatch::agent(agent),
+            &[Action::Send],
+            ResourcePattern::Peer(Pattern::Any),
+        ),
+        Rule::allow(
+            "tools",
+            SubjectMatch::agent(agent),
+            &[Action::Invoke],
+            ResourcePattern::Tool(Pattern::Any),
+        ),
+    ];
+    if needs_control {
+        requested.push(Rule::allow(
+            "control",
+            SubjectMatch {
+                agent: Pattern::parse(agent),
+                min_trust: Some(TrustTier::Privileged),
+                ..Default::default()
+            },
+            &[Action::Control],
+            ResourcePattern::Swarm,
+        ));
+    }
+    AgentManifest {
+        harness: HarnessId::new(harness),
+        agent: agent.to_string(),
+        model_class: mock_class(),
+        tenant: TenantId::new("test"),
+        requested_trust: trust,
+        requested,
+        cache_classes: vec![],
+    }
+}
+
 fn build_swarm(storage: Arc<InMemoryStorage>) -> Swarm {
-    let mut swarm = Swarm::new(storage);
+    let kernel = Kernel::new(
+        root_grants(),
+        Arc::new(RuleSetPolicy::new()),
+        MemoryAudit::new(),
+        Arc::new(SystemClock),
+    );
+    let mut swarm = Swarm::new(storage, kernel);
 
     let worker_tools: Vec<Arc<dyn Tool>> = vec![Arc::new(WordCount), Arc::new(SendMessage)];
     let worker_agent: Box<dyn Agent> = Box::new(BasicAgent::new(
@@ -38,8 +129,11 @@ fn build_swarm(storage: Arc<InMemoryStorage>) -> Swarm {
     )
     .with_seed("Analyze the slogan 'ship fast stay safe' and record a verdict.");
 
-    swarm.register(Box::new(worker));
-    swarm.register(Box::new(planner));
+    swarm.register(Box::new(worker), manifest("worker-local", "worker", TrustTier::Standard, false));
+    swarm.register(
+        Box::new(planner),
+        manifest("planner-cloud", "planner", TrustTier::Privileged, true),
+    );
     swarm
 }
 

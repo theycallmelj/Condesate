@@ -5,7 +5,7 @@
 //! reason about a value lives in the sidecar, so none of them ever has to look
 //! at the value itself.
 
-use crate::identity::{GovernanceLabel, ModelClass};
+use crate::security::identity::{GovernanceLabel, ModelClass};
 
 // ---------------------------------------------------------------------------
 // Value classes
@@ -42,8 +42,8 @@ impl ValueClass {
     /// The weakest model-class relationship at which reuse of this class is
     /// still sound. Wire this into a `Condition::MinCompatibility` when you
     /// build the grant set.
-    pub fn min_compatibility(&self) -> crate::identity::Compatibility {
-        use crate::identity::Compatibility::*;
+    pub fn min_compatibility(&self) -> crate::security::identity::Compatibility {
+        use crate::security::identity::Compatibility::*;
         match self {
             // Tensor layout is revision- and quantization-specific.
             ValueClass::KvBlock => Identical,
@@ -186,7 +186,7 @@ pub struct Candidate {
     /// Cosine distance from the demand vector, `0.0` for an exact-key match.
     pub distance: f32,
     /// Reuse ceiling between the asker and the owning pool.
-    pub compatibility: crate::identity::Compatibility,
+    pub compatibility: crate::security::identity::Compatibility,
 }
 
 /// Why a write was or was not admitted.

@@ -18,73 +18,75 @@
 //! ```
 //!
 //! Every boundary is a trait, so any layer can be replaced independently.
-//! Cross-cutting services (`Storage`, `Bus`) are handed to harnesses via a
-//! `ServiceHandle`, keeping agents and tools decoupled from swarm internals.
+//! Cross-cutting services (`Storage`, `Bus`) reach agents and tools only
+//! through a guarded handle, never a raw one — see `security::kernel`.
 //!
-//! ## The two cross-cutting planes
-//!
-//! Alongside that stack sit two things every layer touches. Both are currently
-//! trait-and-type scaffolding — the shapes are settled, the implementations are
-//! deliberately not written yet.
+//! ## Module tree
 //!
 //! ```text
-//!   identity ─► policy ─► kernel ─► audit        the permission boundary
-//!                            │
-//!                            ▼
-//!                          cache                 the shared KV store
+//!   agent/     how one agent is called and thinks   (live)
+//!   swarm/     the OS layer: harness, IPC, storage   (live)
+//!   security/  the permission boundary               (live: gates every
+//!                                                      tool call, memory
+//!                                                      access, peer message)
+//!   cache/     shared KV store per ModelClass         (scaffolding: traits
+//!                                                      settled, no CachePool
+//!                                                      impl yet)
+//!   faraday/   memory & context engineering           (diary/ideabook/index
+//!                                                      are real; not yet
+//!                                                      wired into the loop)
+//!   types.rs   plain data types shared by everything above
 //! ```
 //!
-//! * [`identity`] — who is acting (`Principal`) and what model they are
-//!   (`ModelClass`), plus the labels that travel with data.
-//! * [`policy`] — capabilities, allow/deny rules, and the deny-wins evaluator.
-//! * [`kernel`] — where the boundary is actually enforced: manifests are
-//!   admitted, the syscall surface is wrapped, every crossing is audited.
-//! * [`audit`] — the append-only record of every decision, denials included.
+//! * [`agent`] — `ModelProvider -> Agent -> AgentLoop`, plus `Tool`.
+//! * [`swarm`] — `Harness -> Swarm`, the bus, storage, and the raw
+//!   `ServiceHandle` that `security::kernel` wraps.
+//! * [`security`] — `Principal` × `Action` × `Resource` → `Decision`, admitted
+//!   into an attenuated `GrantSet`, checked and audited on every crossing.
+//!   `Tool::call` and `Harness::run` both take a guarded handle — there is no
+//!   raw `ServiceHandle` reachable from tool or loop code.
 //! * [`cache`] — a KV pool per `ModelClass`, so agents running the same model
 //!   share work, with an optional peer-federation layer on top.
+//! * [`faraday`] — memory and context engineering, named for Michael
+//!   Faraday's own notebooks: a permanent, addressable `Diary` (episodic
+//!   memory), a revisable `IdeaBook` (in-loop working memory), and
+//!   `Slip`/`RetrievalSheet` composition that preserves surrounding context
+//!   on retrieval rather than returning bare facts.
 
 pub mod agent;
-pub mod audit;
-pub mod bus;
 pub mod cache;
-pub mod harness;
-pub mod identity;
-pub mod kernel;
-pub mod loops;
-pub mod model;
-pub mod policy;
-#[cfg(feature = "remote")]
-pub mod remote;
-pub mod service;
-/// Pure provider request/response mapping (always compiled + tested).
-pub mod wire;
-pub mod storage;
+pub mod faraday;
+pub mod security;
 pub mod swarm;
-pub mod tool;
 pub mod types;
 
-// Convenient flat re-exports.
-pub use agent::{Agent, AgentContext, BasicAgent};
-pub use audit::{AuditEvent, AuditSink, Clock, MemoryAudit, Outcome, SystemClock};
-pub use bus::{Bus, Envelope, Inbox, Payload, Recipient};
+// Convenient flat re-exports — the public API shape is unaffected by which
+// folder a module physically lives in.
+pub use agent::{
+    Agent, AgentContext, AgentLoop, BasicAgent, CloudModel, LocalModel, LoopOutcome, ModelProvider,
+    ReActLoop, Remember, SendMessage, ShutdownSwarm, SingleShot, Tool, WordCount,
+};
+#[cfg(feature = "remote")]
+pub use agent::{AnthropicModel, OpenAiModel};
+#[cfg(feature = "mcp")]
+pub use agent::{McpConnection, McpTool};
 pub use cache::{
     CacheEntry, CacheKey, CachePool, CacheRegistry, Candidate, Demand, Sidecar, ValueClass,
 };
-pub use identity::{Compatibility, GovernanceLabel, ModelClass, Principal, TenantId, TrustTier};
-pub use kernel::{AgentManifest, Admission, GuardedServices, Kernel, Refusal};
-pub use policy::{
-    AccessRequest, Action, Decision, Effect, GrantSet, Obligation, Pattern, PolicyEngine, Resource,
-    ResourcePattern, Rule, RuleSetPolicy, SubjectMatch, ToolBroker,
+pub use faraday::{
+    Diary, DiaryEntry, EntryKind, IdeaBook, InMemoryDiary, InMemoryIdeaBook, Menu, NewDiaryEntry,
+    RetrievalSheet, SheetComposer, Slip, SlipIndex, Speculation, StandardComposer,
 };
-pub use harness::{Harness, StandardHarness};
-pub use loops::{AgentLoop, LoopOutcome, ReActLoop, SingleShot};
-pub use model::{CloudModel, LocalModel, ModelProvider};
-#[cfg(feature = "remote")]
-pub use remote::{AnthropicModel, OpenAiModel};
-pub use service::ServiceHandle;
-pub use storage::{InMemoryStorage, Storage};
-pub use swarm::Swarm;
-pub use tool::{Remember, SendMessage, ShutdownSwarm, Tool, WordCount};
+pub use security::{
+    AccessRequest, Action, AgentManifest, Admission, AuditEvent, AuditSink, Clock, Compatibility,
+    Decision, Effect, GovernanceLabel, GrantSet, GuardedServices, Kernel, MemoryAudit, ModelClass,
+    Obligation, Outcome, Pattern, PolicyEngine, Principal, Refusal, Resource, ResourcePattern, Rule,
+    RuleSetPolicy, SubjectMatch, SystemClock, TenantId, ToolBroker, TrustTier,
+};
+pub use swarm::{
+    Bus, Envelope, Harness, Inbox, InMemoryStorage, Payload, Recipient, ServiceHandle,
+    StandardHarness, Storage, Swarm,
+};
 pub use types::{
     CompletionRequest, CompletionResponse, HarnessId, Message, Role, ToolCall, ToolSpec,
 };

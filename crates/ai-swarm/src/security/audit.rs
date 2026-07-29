@@ -15,7 +15,7 @@
 //! see that an agent read a secret, but not which message talked it into
 //! doing so.
 
-use crate::policy::{Action, Decision, Obligation};
+use super::policy::{Action, Decision, Obligation};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -79,8 +79,8 @@ pub struct PrincipalRef {
     pub trust: String,
 }
 
-impl From<&crate::identity::Principal> for PrincipalRef {
-    fn from(p: &crate::identity::Principal) -> Self {
+impl From<&super::identity::Principal> for PrincipalRef {
+    fn from(p: &super::identity::Principal) -> Self {
         Self {
             harness: p.harness.0.clone(),
             agent: p.agent.clone(),
@@ -99,7 +99,7 @@ pub struct AuditEvent {
     pub at_ms: u64,
     pub principal: PrincipalRef,
     pub action: Action,
-    /// [`crate::policy::Resource::describe`] output.
+    /// [`super::policy::Resource::describe`] output.
     pub resource: String,
     pub decision: Decision,
     pub obligations: Vec<Obligation>,
@@ -211,9 +211,9 @@ impl AuditSink for TracingAudit {
 
 #[cfg(test)]
 mod tests {
+    use super::super::identity::{ModelClass, Principal, TenantId, TrustTier};
+    use super::super::policy::{DenyReason, RuleId};
     use super::*;
-    use crate::identity::{ModelClass, Principal, TenantId, TrustTier};
-    use crate::policy::{DenyReason, RuleId};
     use crate::types::HarnessId;
 
     fn principal() -> Principal {
