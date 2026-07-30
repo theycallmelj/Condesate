@@ -1,4 +1,4 @@
-//! A minimal terminal chat app built on the `ai-swarm` library.
+//! A minimal terminal chat app built on the `condesate` library.
 //!
 //! Demonstrates the consumer pattern: pick a `ModelProvider`, wrap it in a
 //! `BasicAgent`, and drive a `SingleShot` loop turn-by-turn while keeping a
@@ -16,7 +16,7 @@
 use std::io::Write;
 use std::sync::Arc;
 
-use ai_swarm::{
+use condesate::{
     Agent, AgentContext, AgentLoop, AgentManifest, BasicAgent, Bus, CompletionRequest,
     CompletionResponse, GrantSet, HarnessId, Kernel, MemoryAudit, Message, ModelClass,
     ModelProvider, Role, RuleSetPolicy, ServiceHandle, SingleShot, Storage, SystemClock, TenantId,
@@ -69,7 +69,7 @@ impl Storage for NullStorage {
 /// Provider selection when the `remote` feature is ON.
 #[cfg(feature = "remote")]
 fn choose_provider() -> Arc<dyn ModelProvider> {
-    use ai_swarm::{AnthropicModel, OpenAiModel};
+    use condesate::{AnthropicModel, OpenAiModel};
     let provider = std::env::var("PROVIDER").unwrap_or_default().to_lowercase();
     let model = std::env::var("MODEL").ok();
 
@@ -114,7 +114,7 @@ fn choose_provider() -> Arc<dyn ModelProvider> {
 /// flow calls no tools and touches no shared storage, so the manifest asks for
 /// nothing beyond existing — every real syscall would still be denied and
 /// audited, same as any other principal in the swarm.
-fn solo_services() -> Arc<ai_swarm::GuardedServices> {
+fn solo_services() -> Arc<condesate::GuardedServices> {
     let raw = ServiceHandle {
         me: HarnessId::new("chat"),
         roster: Arc::new(vec![HarnessId::new("chat")]),

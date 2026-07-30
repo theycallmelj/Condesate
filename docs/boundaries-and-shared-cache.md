@@ -1,6 +1,6 @@
 # Boundaries and the shared cache
 
-Design notes for the two cross-cutting planes added to `ai-swarm`:
+Design notes for the two cross-cutting planes added to `condesate`:
 a **permission boundary** modelled on an OS, and a **shared KV cache** scoped by
 model type. Both are trait-and-type scaffolding today — the shapes are settled,
 most implementations are deliberately empty.
@@ -273,7 +273,7 @@ Federation touches the permission plane at three distinct points, which is why
 
 ## 4. What is real and what is not
 
-**Implemented and tested (57 tests across `ai-swarm`, including 12 in `faraday` —
+**Implemented and tested (57 tests across `condesate`, including 12 in `faraday` —
 see [faraday-context-engineering.md](faraday-context-engineering.md)):**
 - `RuleSetPolicy` evaluation: default deny, deny-wins, conditions, structural
   tenant isolation

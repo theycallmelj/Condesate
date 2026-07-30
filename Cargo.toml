@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ai-swarm", "crates/chat-app"]
+members = ["crates/condesate", "crates/chat-app"]
 
 [workspace.package]
 edition = "2021"

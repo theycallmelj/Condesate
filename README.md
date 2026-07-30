@@ -1,17 +1,17 @@
-# ai-swarm workspace
+# condesate workspace
 
 A Cargo workspace with two crates:
 
-- **`crates/ai-swarm`** — the trait-driven agent-harness + swarm library.
+- **`crates/condesate`** — the trait-driven agent-harness + swarm library.
 - **`crates/chat-app`** — a small REPL chat app that *imports* the library and
   can talk to OpenAI or Anthropic.
 
 ```
-ai-swarm-ws/
+condesate-ws/
 ├── Cargo.toml            # workspace root
 ├── rust-toolchain.toml
 ├── crates/
-│   ├── ai-swarm/         # library (+ `demo` bin, tests)
+│   ├── condesate/        # library (+ `demo` bin, tests)
 │   └── chat-app/         # consumer app
 ```
 
@@ -19,7 +19,7 @@ ai-swarm-ws/
 
 ```bash
 # run the swarm demo (offline, deterministic mock models)
-cargo run -p ai-swarm --bin demo
+cargo run -p condesate --bin demo
 
 # run the chat app offline (echo provider)
 cargo run -p chat-app
@@ -41,24 +41,30 @@ From the workspace root:
 ```bash
 git init
 git add .
-git commit -m "ai-swarm: agent harness + swarm OS, chat app, providers, tests"
+git commit -m "condesate: agent harness + swarm OS, chat app, providers, tests"
 
 # then point it at a remote and push (create the empty repo on the host first):
 git branch -M main
-git remote add origin git@github.com:<you>/ai-swarm.git   # or the https URL
+git remote add origin git@github.com:<you>/condesate.git   # or the https URL
 git push -u origin main
 ```
+
+> This workspace's own remote is still `git@github.com:theycallmelj/ai-swarm.git`
+> — the crate/package was renamed locally to `condesate`, but the GitHub repo
+> itself was not, since that's an external, harder-to-reverse action. Rename it
+> on GitHub (or via `gh repo rename`) and update the remote with
+> `git remote set-url origin <new-url>` if you want the two to match.
 
 `.gitignore` already excludes `/target` and `.env*` (keep API keys out of git).
 
 ### 2. A project that imports the library
-`crates/chat-app` depends on `ai-swarm` by path and uses its public API
+`crates/chat-app` depends on `condesate` by path and uses its public API
 (`ModelProvider`, `BasicAgent`, `AgentLoop`/`SingleShot`, `Message`, ...) to run
 a persistent chat loop. That's the template for any consumer crate: add
-`ai-swarm = { path = "…" }` (or a git/version dep) and build on the traits.
+`condesate = { path = "…" }` (or a git/version dep) and build on the traits.
 
 ### 3. Connect to OpenAI or Anthropic
-`crates/ai-swarm/src/agent/remote.rs` provides `OpenAiModel` and `AnthropicModel`,
+`crates/condesate/src/agent/remote.rs` provides `OpenAiModel` and `AnthropicModel`,
 both implementing `ModelProvider`, behind the `remote` feature (so the offline
 core stays dependency-light). The request/response mapping lives in
 `src/agent/wire.rs` as pure functions and is unit-tested without any network.
@@ -70,15 +76,20 @@ core stays dependency-light). The request/response mapping lives in
 
 ### 4. Tests
 ```bash
-cargo test                      # 20 tests: unit + integration, all offline
-cargo test -p ai-swarm --features remote   # + reqwest client build (needs current stable)
+cargo test                                   # unit + integration, all offline
+cargo test -p condesate --features remote    # + reqwest client build (needs current stable)
+cargo test -p condesate --features mcp       # + MCP tool integration (in-process test server)
 ```
 
 Covered: storage round-trip & prefix listing; bus direct-send / broadcast /
 unknown-route error; tools (word_count, remember, send_message); the ReAct and
 SingleShot loops incl. the step-budget cap; provider request-building and
-response-parsing for both vendors; and a full end-to-end swarm run asserting the
-verdict written to shared storage.
+response-parsing for both vendors; a full end-to-end swarm run asserting the
+verdict written to shared storage; the permission boundary (admission,
+attenuation, revocation, audit); memory/context engineering (`faraday`); and
+MCP tool discovery/calling, including proof that a denied call never reaches
+the server.
 
-See `crates/ai-swarm/README.md` for the architecture and per-trait extension
-guide.
+See `crates/condesate/README.md` for the architecture and per-trait extension
+guide, and `docs/references.md` for the source material behind the
+non-obvious design choices.

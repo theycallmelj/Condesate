@@ -1,11 +1,11 @@
 [package]
-name = "ai-swarm"
+name = "condesate"
 version.workspace = true
 edition.workspace = true
 description = "A trait-driven AI agent harness with a swarm layer that behaves like a tiny OS."
 
 [lib]
-name = "ai_swarm"
+name = "condesate"
 path = "src/lib.rs"
 
 [[bin]]

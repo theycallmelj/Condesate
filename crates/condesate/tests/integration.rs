@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use ai_swarm::{
+use condesate::{
     Action, Agent, AgentManifest, BasicAgent, CloudModel, GrantSet, HarnessId, InMemoryStorage,
     Kernel, LocalModel, MemoryAudit, ModelClass, Pattern, ReActLoop, Remember, ResourcePattern,
     Rule, RuleSetPolicy, SendMessage, ShutdownSwarm, StandardHarness, Storage, SubjectMatch,

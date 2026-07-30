@@ -196,7 +196,12 @@ mod tests {
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
-            let _ = server.serve(server_io).await;
+            // `.serve()` only awaits the handshake and returns a handle; the
+            // handle itself must stay alive for the connection to stay open,
+            // so wait on it here rather than letting it drop when this task
+            // function returns.
+            let running = server.serve(server_io).await.expect("server handshake");
+            let _ = running.waiting().await;
         });
 
         let client = ().serve(client_io).await.expect("client handshake");

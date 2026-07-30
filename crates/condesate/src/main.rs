@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use ai_swarm::{
+use condesate::{
     Action, Agent, AgentManifest, BasicAgent, CloudModel, GrantSet, HarnessId, Kernel, LocalModel,
     MemoryAudit, ModelClass, Pattern, ReActLoop, Remember, ResourcePattern, Rule, RuleSetPolicy,
     SendMessage, ShutdownSwarm, StandardHarness, Storage, SubjectMatch, Swarm, SystemClock,
@@ -137,7 +137,7 @@ fn manifest(harness: &str, agent: &str, trust: TrustTier, needs_control: bool) -
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // --- shared services --------------------------------------------------
-    let storage = ai_swarm::InMemoryStorage::new();
+    let storage = condesate::InMemoryStorage::new();
     let kernel = Kernel::new(
         root_grants(),
         Arc::new(RuleSetPolicy::new()),

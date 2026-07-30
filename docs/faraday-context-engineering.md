@@ -1,6 +1,6 @@
 # Faraday: memory and context engineering
 
-Design notes for `crates/ai-swarm/src/faraday/` — a memory subsystem named for
+Design notes for `crates/condesate/src/faraday/` — a memory subsystem named for
 Michael Faraday, built directly from the historical record of how he actually
 organized his own notebooks.
 
@@ -35,7 +35,7 @@ Know"* names three levels of agent engineering:
 - **Level 3** — a *system*-level loop: operations happen both inside and
   outside the loop, and the harness itself becomes the durable thing.
 
-`ai-swarm`'s [`crate::agent::loops`] (`SingleShot`, `ReActLoop`) is Level 1 on
+`condesate`'s [`crate::agent::loops`] (`SingleShot`, `ReActLoop`) is Level 1 on
 its own. `faraday` is what moves a harness up:
 
 | Level | Faraday device | This module |

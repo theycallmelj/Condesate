@@ -1,4 +1,4 @@
-//! # ai-swarm
+//! # condesate
 //!
 //! A trait-driven AI agent harness with a swarm layer that behaves like a tiny
 //! operating system.

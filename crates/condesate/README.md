@@ -1,4 +1,4 @@
-# ai-swarm
+# condesate
 
 A trait-driven AI agent **harness** in Rust, with a **swarm** layer on top that
 behaves like a tiny operating system: concurrent harnesses ("processes"),
@@ -42,7 +42,7 @@ src/
 ```
 
 Each folder's `mod.rs` re-exports its public types, so the crate's flat public
-API (`ai_swarm::Agent`, `ai_swarm::Kernel`, ...) is unaffected by which folder
+API (`condesate::Agent`, `condesate::Kernel`, ...) is unaffected by which folder
 a module physically lives in — only code *inside* the crate needs to know the
 internal path.
 
@@ -73,6 +73,7 @@ shutdown, then a dump of shared storage.
 | `CachePool` / `CacheRegistry` | `src/cache/pool.rs` | the shared KV store behind it: map, sqlite, Redis, a vector index |
 | `PullPlanner` / `PeerTransport` | `src/cache/federation.rs` | how (and whether) cache values move between nodes |
 | `Diary` / `IdeaBook` | `src/faraday/` | memory and context engineering — swap the in-memory versions for a durable store |
+| `Tool` (MCP-backed) | `src/agent/mcp.rs` (feature `mcp`) | call tools exposed by any MCP server instead of local Rust code |
 
 ## The cross-cutting planes
 
@@ -118,6 +119,19 @@ through a *window* of surrounding entries, not the bare entry alone — directly
 reproducing a finding from the historical record this module is modeled on:
 retrieval that drops surrounding context stops being meaningful. See the doc
 for the full mapping and the primary source.
+
+**Tools over MCP (feature `mcp`).** `McpTool` proxies a tool exposed by a real
+[MCP](https://github.com/modelcontextprotocol/rust-sdk) server (spawned as a
+child process, `tools/call` over stdio) through the same `Tool` trait as
+native tools. Nothing MCP-specific is required for gating: the permission
+check in `security::kernel::GuardedServices::authorize_tool` already runs
+before *any* `Tool::call`, native or MCP, so a denied tool's `tools/call`
+request is never sent — proven end to end in `agent/mcp.rs`'s tests with an
+in-process server that counts how many times it was actually invoked.
+
+Source material for all of the above (Pluribus, Faraday's notebooks, the
+Oracle memory/agent-loop framing, the MCP SDK) is indexed in
+[`docs/references.md`](../../docs/references.md).
 
 ## Design notes
 
