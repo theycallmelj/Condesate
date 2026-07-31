@@ -1,0 +1,4 @@
+{"input": "count words in: ship fast stay safe", "expected": "4"}
+{"input": "count words in: the quick brown fox jumps over", "expected": "6"}
+{"input": "shutdown", "expected": "denied"}
+{"input": "echo this back to me", "expected": "echo this back to me"}

@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/condesate", "crates/chat-app"]
+members = ["crates/condesate", "crates/chat-app", "crates/evals"]
 
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "io-util", "net", "process"] }
 async-trait = "0.1"
 anyhow = "1"
 serde_json = "1"

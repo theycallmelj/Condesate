@@ -1,0 +1,23 @@
+[package]
+name = "evals"
+version.workspace = true
+edition.workspace = true
+description = "Evaluation harness for condesate: runs golden cases against the real agent loop and reports table/JSON/CSV/dashboard output."
+default-run = "evals"
+
+[lib]
+name = "evals"
+path = "src/lib.rs"
+
+[[bin]]
+name = "evals"
+path = "src/main.rs"
+
+[dependencies]
+condesate = { path = "../condesate" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+csv = "1"

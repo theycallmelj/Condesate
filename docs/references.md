@@ -62,3 +62,26 @@ stdio) are proxied through the same `Tool` trait as native tools, so they
 pass through the *same* call-time permission gate in
 `crate::agent::loops::execute_tools` before a request is ever sent — see
 `mcp.rs`'s module docs for why no second, MCP-specific check exists.
+
+## Evaluation harness — `crates/evals/`
+
+**Harness. `harness-evals`.** <https://github.com/harness/harness-evals>
+Used two ways in `crates/evals/`. First, as vocabulary: `golden.rs`,
+`outcome.rs`, and `metrics.rs` reuse its `Golden` (authored input +
+expectation) → `EvalCase`-equivalent (`CaseOutcome` here) → `Metric` →
+normalized `Score` (0.0–1.0, threshold, computed `passed`) shape, and its
+"Five Dimensions" framing (Correctness, Groundedness, Safety, Trajectory,
+Performance), each dimension set by the metric that measures it rather than
+chosen per case. Second, as a literal dependency: `harness_evals_run.rs` and
+`server.rs` are a real integration — the real, pip-installed `harness-evals`
+CLI is run against a real HTTP endpoint (`server.rs`, matching its
+`HttpTarget`'s `{"input"} -> {"output"}` contract exactly) in front of the
+real `condesate` agent loop, using its own real `contains`/`latency`
+metrics — not a reimplementation. See `crates/evals/README.md` §2.
+
+**Daniel Rosehill (@danielrosehill). "Awesome AI Evaluations & Benchmarks."**
+<https://github.com/danielrosehill/Awesome-AI-Evaluations-Tools>
+A curated survey of open-source eval frameworks and benchmark suites, used
+as the broader map of what "an evals app" typically reports (a scored table,
+machine-readable exports, a dashboard) when scoping `evals`' four output
+formats — stdout table, `report.json`, `report.csv`, `dashboard.html`.

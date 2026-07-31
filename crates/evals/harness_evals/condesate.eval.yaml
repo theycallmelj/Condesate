@@ -1,0 +1,27 @@
+# Real harness-evals config (https://github.com/harness/harness-evals)
+# targeting the real condesate agent loop over HTTP.
+#
+# Run via `cargo run -p evals --bin harness_evals_run`, which starts the
+# target server (`cargo run -p evals --bin eval_target_server`) for you —
+# or start the server yourself and run this directly:
+#
+#   harness-evals run condesate.eval.yaml   (from this directory)
+
+name: condesate-http-agent
+
+dataset: ./goldens.jsonl
+
+target:
+  type: http
+  url: http://127.0.0.1:8080/run
+  output_path: $.output
+  timeout_s: 10
+  retries: 1
+
+metrics:
+  - contains
+  - { kind: latency, threshold: 0.5, params: { max_ms: 2000 } }
+
+sinks:
+  - stdout
+  - { type: json, path: results.jsonl }

@@ -1,10 +1,14 @@
 # condesate workspace
 
-A Cargo workspace with two crates:
+A Cargo workspace with three crates:
 
 - **`crates/condesate`** — the trait-driven agent-harness + swarm library.
 - **`crates/chat-app`** — a small REPL chat app that *imports* the library and
   can talk to OpenAI or Anthropic.
+- **`crates/evals`** — an evaluation harness: a native suite against the real
+  `condesate` agent loop (table/JSON/CSV/dashboard output), plus a real
+  integration with the [`harness-evals`](https://github.com/harness/harness-evals)
+  CLI over HTTP.
 
 ```
 condesate-ws/
@@ -12,7 +16,8 @@ condesate-ws/
 ├── rust-toolchain.toml
 ├── crates/
 │   ├── condesate/        # library (+ `demo` bin, tests)
-│   └── chat-app/         # consumer app
+│   ├── chat-app/         # consumer app
+│   └── evals/            # eval harness: native suite + real harness-evals HTTP integration
 ```
 
 ## Quick start
@@ -31,6 +36,12 @@ cargo run -p chat-app --features remote
 
 # run all tests (offline)
 cargo test
+
+# run the native eval suite — prints a table, and writes evals-out/{report.json,report.csv,dashboard.html}
+cargo run -p evals
+
+# run the REAL harness-evals CLI against condesate over HTTP (needs: pip install harness-evals httpx)
+cargo run -p evals --bin harness_evals_run
 ```
 
 ## The four pieces you asked for
@@ -91,5 +102,5 @@ MCP tool discovery/calling, including proof that a denied call never reaches
 the server.
 
 See `crates/condesate/README.md` for the architecture and per-trait extension
-guide, and `docs/references.md` for the source material behind the
-non-obvious design choices.
+guide, `crates/evals/README.md` for the eval suite, and `docs/references.md`
+for the source material behind the non-obvious design choices.
