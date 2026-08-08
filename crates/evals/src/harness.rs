@@ -125,3 +125,14 @@ pub fn read_write_memory(agent: &str) -> Rule {
 pub fn send_to_any_peer(agent: &str) -> Rule {
     Rule::allow("talk", SubjectMatch::agent(agent), &[Action::Send], ResourcePattern::Peer(Pattern::Any))
 }
+
+/// Scopes an Invoke grant to exactly one tool name — e.g. one namespaced MCP
+/// tool (`mcp:<server>:<tool>`) rather than every tool a server advertises.
+pub fn invoke_exact_tool(agent: &str, tool_name: &str) -> Rule {
+    Rule::allow(
+        "tool",
+        SubjectMatch::agent(agent),
+        &[Action::Invoke],
+        ResourcePattern::Tool(Pattern::Exact(tool_name.to_string())),
+    )
+}

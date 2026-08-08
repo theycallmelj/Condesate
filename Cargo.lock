@@ -93,6 +93,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "condesate",
+ "dotenvy",
  "tokio",
 ]
 
@@ -169,6 +170,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dotenvy"
+version = "0.15.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -207,6 +214,7 @@ dependencies = [
  "async-trait",
  "condesate",
  "csv",
+ "dotenvy",
  "serde",
  "serde_json",
  "tokio",
@@ -598,6 +606,18 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "leader-search"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "condesate",
+ "dotenvy",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

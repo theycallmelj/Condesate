@@ -14,3 +14,4 @@ condesate = { path = "../condesate" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+dotenvy = "0.15"

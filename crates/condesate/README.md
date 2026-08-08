@@ -74,6 +74,7 @@ shutdown, then a dump of shared storage.
 | `PullPlanner` / `PeerTransport` | `src/cache/federation.rs` | how (and whether) cache values move between nodes |
 | `Diary` / `IdeaBook` | `src/faraday/` | memory and context engineering — swap the in-memory versions for a durable store |
 | `Tool` (MCP-backed) | `src/agent/mcp.rs` (feature `mcp`) | call tools exposed by any MCP server instead of local Rust code |
+| `PromptedToolModel` | `src/agent/prompted_tools.rs` | prompted (ReAct-style) tool-calling for a `ModelProvider` with no native tool-use wire format — see its doc comment |
 
 ## The cross-cutting planes
 
@@ -101,7 +102,13 @@ resource *and* the subject, so a child can't silently drop a parent's trust
 floor). The `Kernel` admits an `AgentManifest` into that `GrantSet`, wraps
 `ServiceHandle` in a `GuardedServices`, and `Swarm`/`Harness`/`Tool` all run
 through it: every real crossing goes check → audit → effect, and an effect
-that could not be audited does not run.
+that could not be audited does not run. Admission isn't only a startup-time
+step, either — `GuardedServices::spawn_child` lets an already-admitted
+principal admit a child at runtime, gated on `Action::Spawn` and attenuated
+from *its own* `GrantSet` rather than the kernel's root, so a spawner can
+never hand out more than it holds. See `crates/leader-search` for a real
+consumer (a leader that dynamically spawns and tears down a web-search
+agent) and `security::kernel::tests::spawn_child_*` for the proof.
 
 **Shared KV store — scaffolding.** One `CachePool` per `ModelClass`, so agents
 running the same model share work. How far a value crosses between classes is

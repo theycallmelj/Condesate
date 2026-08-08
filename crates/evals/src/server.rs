@@ -16,13 +16,23 @@
 //! deliberately left ungranted, so the "shutdown" golden proves the same
 //! thing `suite::safety_denied_tool_never_executes` does, but reached over
 //! real HTTP instead of a direct function call.
+//!
+//! **The model.** If `PROVIDER`/`ANTHROPIC_API_KEY` (or `OPENAI_API_KEY`)
+//! are set — including via a `.env` file, loaded automatically — this
+//! serves real inference: `AnthropicModel`/`OpenAiModel` actually decide
+//! whether and which tool to call, given the input, via
+//! `condesate::PromptedToolModel` (see its docs for why that wrapper exists
+//! instead of a vendor's native tool-use wire format). With no key
+//! configured, this falls back to [`HttpEvalModel`], the original
+//! deterministic script, so the eval paths still work offline.
 
 use anyhow::Result;
 use async_trait::async_trait;
 use condesate::{
-    Action, Agent, AgentContext, AgentLoop, BasicAgent, CompletionRequest, CompletionResponse,
-    Message, ModelProvider, Pattern, ReActLoop, ResourcePattern, Role, Rule, ShutdownSwarm,
-    SubjectMatch, ToolCall, WordCount,
+    tool_instructions, Action, Agent, AgentContext, AgentLoop, AnthropicModel, BasicAgent,
+    CompletionRequest, CompletionResponse, Message, ModelProvider, OpenAiModel, Pattern,
+    PromptedToolModel, ReActLoop, ResourcePattern, Role, Rule, ShutdownSwarm, SubjectMatch, Tool,
+    ToolCall, WordCount,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -31,7 +41,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::harness::build_services;
 
-/// Scripts exactly two intents recognized by the goldens in
+/// Deterministic fallback used when no real provider is configured. Scripts
+/// exactly two intents recognized by the goldens in
 /// `harness_evals/goldens.jsonl`, plus an echo fallback:
 ///   - `"count words in: <text>"` -> calls `word_count`, reports the count.
 ///   - `"shutdown"` -> calls `shutdown_swarm` (ungranted -> denied).
@@ -40,7 +51,7 @@ struct HttpEvalModel;
 #[async_trait]
 impl ModelProvider for HttpEvalModel {
     fn name(&self) -> &str {
-        "http-eval"
+        "http-eval-scripted"
     }
 
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse> {
@@ -69,7 +80,81 @@ impl ModelProvider for HttpEvalModel {
     }
 }
 
-async fn run_target(input: &str) -> Result<String> {
+fn system_prompt() -> String {
+    tool_instructions(&[WordCount.spec(), ShutdownSwarm.spec()])
+}
+
+/// Picks a real provider from `PROVIDER`/`ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/
+/// `MODEL` (a `.env` file is loaded automatically — see `serve()`), falling
+/// back to the deterministic [`HttpEvalModel`] if none is configured. Mirrors
+/// `chat-app`'s `choose_provider()`.
+fn choose_model() -> (Arc<dyn ModelProvider>, String) {
+    let provider = std::env::var("PROVIDER").unwrap_or_default().to_lowercase();
+    let model_name = std::env::var("MODEL").ok();
+
+    match provider.as_str() {
+        "anthropic" => {
+            let name = model_name.unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+            match AnthropicModel::from_env(name.clone()) {
+                Ok(m) => (
+                    Arc::new(PromptedToolModel::new(Arc::new(m))) as Arc<dyn ModelProvider>,
+                    format!("live: anthropic ({name})"),
+                ),
+                Err(e) => {
+                    eprintln!("[eval target] anthropic unavailable ({e}); falling back to the scripted offline model");
+                    (Arc::new(HttpEvalModel), "scripted (offline)".to_string())
+                }
+            }
+        }
+        "openai" => {
+            let name = model_name.unwrap_or_else(|| "gpt-4o".to_string());
+            match OpenAiModel::from_env(name.clone()) {
+                Ok(m) => (
+                    Arc::new(PromptedToolModel::new(Arc::new(m))) as Arc<dyn ModelProvider>,
+                    format!("live: openai ({name})"),
+                ),
+                Err(e) => {
+                    eprintln!("[eval target] openai unavailable ({e}); falling back to the scripted offline model");
+                    (Arc::new(HttpEvalModel), "scripted (offline)".to_string())
+                }
+            }
+        }
+        _ => {
+            eprintln!(
+                "[eval target] set PROVIDER=anthropic|openai (+ API key, e.g. in .env) to use a \
+                 live model; using the scripted offline model"
+            );
+            (Arc::new(HttpEvalModel), "scripted (offline)".to_string())
+        }
+    }
+}
+
+/// Wraps a model and records every tool name it actually decides to call —
+/// not what a client expects it to call. A real model's decision isn't
+/// guaranteed the way the scripted fallback's was, so callers (e.g.
+/// `strands_eval.py`'s `ToolCalled` check) need the real answer, not a
+/// guess inferred from the input text.
+struct RecordingModel {
+    inner: Arc<dyn ModelProvider>,
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl ModelProvider for RecordingModel {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse> {
+        let resp = self.inner.complete(req).await?;
+        if !resp.tool_calls.is_empty() {
+            let mut calls = self.calls.lock().unwrap();
+            calls.extend(resp.tool_calls.iter().map(|c| c.name.clone()));
+        }
+        Ok(resp)
+    }
+}
+
+async fn run_target(model: Arc<dyn ModelProvider>, system_prompt: Arc<String>, input: &str) -> Result<(String, Vec<String>)> {
     let grants = vec![Rule::allow(
         "word_count",
         SubjectMatch::agent("http-eval"),
@@ -77,15 +162,25 @@ async fn run_target(input: &str) -> Result<String> {
         ResourcePattern::Tool(Pattern::Exact("word_count".into())),
     )];
     let (svc, _inboxes) = build_services("http-eval", &["http-eval"], grants);
-    let agent =
-        BasicAgent::new("http-eval", "system", Arc::new(HttpEvalModel), vec![Arc::new(WordCount), Arc::new(ShutdownSwarm)]);
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recording_model = Arc::new(RecordingModel { inner: model, calls: calls.clone() });
+    let agent = BasicAgent::new(
+        "http-eval",
+        system_prompt.as_str(),
+        recording_model,
+        vec![Arc::new(WordCount), Arc::new(ShutdownSwarm)],
+    );
     let mut ctx = AgentContext::new(svc);
     ctx.transcript.push(Message::user(input.to_string()));
-    let outcome = ReActLoop::default().run(&agent as &dyn Agent, &mut ctx).await?;
-    Ok(outcome.final_text)
+    // Capped well below the default (8): with a real model in the loop, a
+    // runaway retry burns real API calls, so failing fast here is cheaper
+    // than letting a confused model keep trying.
+    let outcome = ReActLoop { max_steps: 4 }.run(&agent as &dyn Agent, &mut ctx).await?;
+    let tools_called = calls.lock().unwrap().clone();
+    Ok((outcome.final_text, tools_called))
 }
 
-async fn handle(stream: TcpStream) -> Result<()> {
+async fn handle(stream: TcpStream, model: Arc<dyn ModelProvider>, system_prompt: Arc<String>) -> Result<()> {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
 
@@ -112,8 +207,10 @@ async fn handle(stream: TcpStream) -> Result<()> {
         match serde_json::from_slice::<serde_json::Value>(&body) {
             Ok(v) => {
                 let input = v.get("input").and_then(|s| s.as_str()).unwrap_or("").to_string();
-                match run_target(&input).await {
-                    Ok(output) => (200, "OK", json!({ "output": output }).to_string()),
+                match run_target(model, system_prompt, &input).await {
+                    Ok((output, tools_called)) => {
+                        (200, "OK", json!({ "output": output, "tools_called": tools_called }).to_string())
+                    }
                     Err(e) => (500, "Internal Server Error", json!({ "error": e.to_string() }).to_string()),
                 }
             }
@@ -136,12 +233,19 @@ async fn handle(stream: TcpStream) -> Result<()> {
 /// is already in use) — per-connection errors are logged and otherwise
 /// ignored so one bad request can't take the server down.
 pub async fn serve(addr: &str) -> Result<()> {
+    dotenvy::dotenv().ok();
+    let (model, label) = choose_model();
+    eprintln!("condesate eval target model: {label}");
+    let system_prompt = Arc::new(system_prompt());
+
     let listener = TcpListener::bind(addr).await?;
     eprintln!("condesate eval target listening on http://{addr}/run");
     loop {
         let (stream, _) = listener.accept().await?;
+        let model = model.clone();
+        let system_prompt = system_prompt.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(stream).await {
+            if let Err(e) = handle(stream, model, system_prompt).await {
                 eprintln!("eval target connection error: {e}");
             }
         });

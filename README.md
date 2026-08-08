@@ -1,14 +1,17 @@
 # condesate workspace
 
-A Cargo workspace with three crates:
+A Cargo workspace with four crates:
 
 - **`crates/condesate`** — the trait-driven agent-harness + swarm library.
 - **`crates/chat-app`** — a small REPL chat app that *imports* the library and
   can talk to OpenAI or Anthropic.
 - **`crates/evals`** — an evaluation harness: a native suite against the real
-  `condesate` agent loop (table/JSON/CSV/dashboard output), plus a real
-  integration with the [`harness-evals`](https://github.com/harness/harness-evals)
-  CLI over HTTP.
+  `condesate` agent loop (table/JSON/CSV/dashboard output), plus real
+  integrations with four external eval tools — `harness-evals`, `agentevals`,
+  `strands-agents-evals`, and `iris-eval/mcp-server`.
+- **`crates/leader-search`** — a two-agent demo: a leader that dynamically
+  spawns and terminates a web-search agent (real MCP server, no API key),
+  both driven by the same live model.
 
 ```
 condesate-ws/
@@ -17,7 +20,8 @@ condesate-ws/
 ├── crates/
 │   ├── condesate/        # library (+ `demo` bin, tests)
 │   ├── chat-app/         # consumer app
-│   └── evals/            # eval harness: native suite + real harness-evals HTTP integration
+│   ├── evals/            # eval harness: native suite + real harness-evals HTTP integration
+│   └── leader-search/    # leader + dynamically-spawned search agent, real MCP web search
 ```
 
 ## Quick start
@@ -29,19 +33,39 @@ cargo run -p condesate --bin demo
 # run the chat app offline (echo provider)
 cargo run -p chat-app
 
-# run the chat app against a real model
+# run the chat app against a real model — reads PROVIDER/ANTHROPIC_API_KEY/OPENAI_API_KEY/MODEL
+# from your shell env, or automatically from a `.env` file (cp .env.example .env and fill it in)
 cargo run -p chat-app --features remote
-#   PROVIDER=anthropic ANTHROPIC_API_KEY=sk-... MODEL=claude-sonnet-4-6
-#   PROVIDER=openai    OPENAI_API_KEY=sk-...    MODEL=gpt-4o
 
 # run all tests (offline)
 cargo test
 
+# set up + run every eval path in one shot (venv, real pip installs, all 5 binaries)
+# NOTE: uses a real, billed model if PROVIDER + an API key are set (incl. via .env) — see crates/evals/README.md
+./crates/evals/run-all.sh
+
+# ...or run pieces individually:
+
 # run the native eval suite — prints a table, and writes evals-out/{report.json,report.csv,dashboard.html}
 cargo run -p evals
 
-# run the REAL harness-evals CLI against condesate over HTTP (needs: pip install harness-evals httpx)
+# run the REAL harness-evals CLI against condesate over HTTP — real model if .env is set, else offline script
+# (needs: pip install harness-evals httpx)
 cargo run -p evals --bin harness_evals_run
+
+# run the REAL agentevals trajectory matcher against real (incl. regressed) condesate runs — always offline/scripted
+# (needs: pip install agentevals)
+cargo run -p evals --bin agentevals_run
+
+# run the REAL strands-agents-evals Experiment against condesate over HTTP — real model if .env is set, else offline script
+# (needs: pip install strands-agents-evals)
+cargo run -p evals --bin strands_evals_run
+
+# run the REAL iris-eval MCP server via condesate's own MCP client (needs: Node.js 20+)
+cargo run -p evals --bin iris_eval_run
+
+# run the leader + web-search agent demo (needs PROVIDER + API key, e.g. in .env; Node.js 20+)
+cargo run -p leader-search
 ```
 
 ## The four pieces you asked for
@@ -97,10 +121,12 @@ unknown-route error; tools (word_count, remember, send_message); the ReAct and
 SingleShot loops incl. the step-budget cap; provider request-building and
 response-parsing for both vendors; a full end-to-end swarm run asserting the
 verdict written to shared storage; the permission boundary (admission,
-attenuation, revocation, audit); memory/context engineering (`faraday`); and
+attenuation, revocation, audit, and dynamic child spawning via
+`GuardedServices::spawn_child`); memory/context engineering (`faraday`); and
 MCP tool discovery/calling, including proof that a denied call never reaches
 the server.
 
 See `crates/condesate/README.md` for the architecture and per-trait extension
-guide, `crates/evals/README.md` for the eval suite, and `docs/references.md`
-for the source material behind the non-obvious design choices.
+guide, `crates/evals/README.md` for the eval suite, `crates/leader-search/README.md`
+for the two-agent demo, and `docs/references.md` for the source material
+behind the non-obvious design choices.

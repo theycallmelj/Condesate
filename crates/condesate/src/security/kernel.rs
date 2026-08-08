@@ -517,6 +517,32 @@ impl GuardedServices {
     pub fn unguarded(&self) -> &ServiceHandle {
         &self.inner
     }
+
+    // -- spawning -------------------------------------------------------
+
+    /// Admit a child principal, the same way [`Kernel::admit`] admits any
+    /// top-level one — except the authority it attenuates from is *this*
+    /// principal's own admitted `GrantSet`, not the kernel's root. A child
+    /// can never hold more than its spawner holds, for the same reason a
+    /// spawner can never hold more than the kernel's root: attenuation only
+    /// ever narrows (see [`super::policy::GrantSet::attenuate`]).
+    ///
+    /// Gated on `Action::Spawn` against `Resource::Spawn { agent }` — checked
+    /// and audited like every other syscall here — so a principal without an
+    /// explicit spawn grant cannot create children at all, regardless of what
+    /// else it holds. The caller builds `raw` (the child's own `ServiceHandle`
+    /// — its own storage view, its own bus routes) since only the caller knows
+    /// what that child actually needs to reach.
+    pub async fn spawn_child(
+        &self,
+        manifest: &AgentManifest,
+        raw: ServiceHandle,
+    ) -> std::result::Result<GuardedServices, Refusal> {
+        self.check(Action::Spawn, &Resource::Spawn { agent: manifest.agent.clone() }).await?;
+        let parent = Admission { principal: self.principal.clone(), grants: self.grants.clone(), dropped: vec![] };
+        let child = self.kernel.admit(manifest, Some(&parent));
+        Ok(self.kernel.attach(&child, raw))
+    }
 }
 
 #[cfg(test)]
@@ -736,7 +762,7 @@ mod tests {
         let refusal = svc
             .check(Action::Write, &Resource::Memory { key: "prod/config".into() })
             .await
-            .unwrap_err();
+            .err().unwrap();
         assert!(matches!(
             refusal,
             Refusal::Escalated { to: Approver::Operator, ref rule, .. } if rule.0 == "ask-first"
@@ -759,5 +785,89 @@ mod tests {
         visible.sort();
         assert_eq!(visible, vec!["scratch/a".to_string(), "scratch/b".to_string()]);
         assert!(svc.storage_keys("").await.is_err(), "listing everything is not granted");
+    }
+
+    fn spawn_rule(spawner: &str, child_agent_pattern: &str) -> Rule {
+        Rule::allow(
+            "spawn-child",
+            SubjectMatch::agent(spawner),
+            &[Action::Spawn],
+            ResourcePattern::Spawn(Pattern::parse(child_agent_pattern)),
+        )
+    }
+
+    /// Unscoped so it can cover a child rule scoped to a *different* agent —
+    /// a leader re-delegating scratch access to a child it spawns needs a
+    /// rule whose subject already reaches that child's name, not just its own.
+    fn any_scratch_rw() -> Rule {
+        Rule::allow(
+            "mem-scratch",
+            SubjectMatch::default(),
+            &[Action::Read, Action::Write],
+            ResourcePattern::Memory(Pattern::parse("scratch/*")),
+        )
+    }
+
+    #[tokio::test]
+    async fn spawn_child_is_refused_without_a_spawn_grant() {
+        let (kernel, _) = kernel_with(root()); // root() grants no Action::Spawn at all
+        let adm = kernel.admit(&manifest("leader", TrustTier::Standard, vec![]), None);
+        let leader = kernel.attach(&adm, services("leader"));
+
+        let err = leader
+            .spawn_child(&manifest("search", TrustTier::Standard, vec![]), services("search"))
+            .await
+            .err().unwrap();
+        assert!(matches!(err, Refusal::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn spawn_child_admits_a_principal_attenuated_from_the_parent() {
+        let root_grants = GrantSet::new(vec![any_scratch_rw(), spawn_rule("leader", "search")]);
+        let (kernel, _) = kernel_with(root_grants);
+        let leader_adm = kernel.admit(
+            &manifest("leader", TrustTier::Standard, vec![any_scratch_rw(), spawn_rule("leader", "search")]),
+            None,
+        );
+        let leader = kernel.attach(&leader_adm, services("leader"));
+
+        let child_requested = vec![Rule::allow(
+            "w-mem",
+            SubjectMatch::agent("search"),
+            &[Action::Read, Action::Write],
+            ResourcePattern::Memory(Pattern::parse("scratch/search/*")),
+        )];
+        let child = leader
+            .spawn_child(&manifest("search", TrustTier::Standard, child_requested), services("search"))
+            .await
+            .unwrap();
+
+        assert_eq!(child.principal().parent, Some(HarnessId::new("leader")));
+        // Granted: within the narrow slice the child actually asked for.
+        assert!(child.storage_set("scratch/search/q", "hello").await.is_ok());
+        // Not granted: the child never requested this, even though the
+        // leader's own rule would have covered it too.
+        assert!(child.storage_set("scratch/other/x", "x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_spawned_child_cannot_spawn_a_grandchild_without_its_own_spawn_grant() {
+        let root_grants = GrantSet::new(vec![spawn_rule("leader", "search")]);
+        let (kernel, _) = kernel_with(root_grants);
+        let leader_adm =
+            kernel.admit(&manifest("leader", TrustTier::Standard, vec![spawn_rule("leader", "search")]), None);
+        let leader = kernel.attach(&leader_adm, services("leader"));
+
+        // The child's own manifest never asks for Action::Spawn, so it has
+        // none to attenuate from when it tries to spawn its own child.
+        let child = leader
+            .spawn_child(&manifest("search", TrustTier::Standard, vec![]), services("search"))
+            .await
+            .unwrap();
+        let err = child
+            .spawn_child(&manifest("grandchild", TrustTier::Standard, vec![]), services("grandchild"))
+            .await
+            .err().unwrap();
+        assert!(matches!(err, Refusal::Denied(_)));
     }
 }

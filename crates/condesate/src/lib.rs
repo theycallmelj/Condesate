@@ -63,8 +63,9 @@ pub mod types;
 // Convenient flat re-exports — the public API shape is unaffected by which
 // folder a module physically lives in.
 pub use agent::{
-    Agent, AgentContext, AgentLoop, BasicAgent, CloudModel, LocalModel, LoopOutcome, ModelProvider,
-    ReActLoop, Remember, SendMessage, ShutdownSwarm, SingleShot, Tool, WordCount,
+    tool_instructions, Agent, AgentContext, AgentLoop, BasicAgent, CloudModel, LocalModel,
+    LoopOutcome, ModelProvider, PromptedToolModel, ReActLoop, Remember, SendMessage, ShutdownSwarm,
+    SingleShot, Tool, WordCount,
 };
 #[cfg(feature = "remote")]
 pub use agent::{AnthropicModel, OpenAiModel};

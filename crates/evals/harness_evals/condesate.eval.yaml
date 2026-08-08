@@ -15,12 +15,15 @@ target:
   type: http
   url: http://127.0.0.1:8080/run
   output_path: $.output
-  timeout_s: 10
+  timeout_s: 30
   retries: 1
 
+# max_ms is generous because the target may be a real network model call
+# (PROVIDER=anthropic|openai in .env) rather than the offline scripted
+# fallback — see evals::server for which one actually answered.
 metrics:
   - contains
-  - { kind: latency, threshold: 0.5, params: { max_ms: 2000 } }
+  - { kind: latency, threshold: 0.5, params: { max_ms: 15000 } }
 
 sinks:
   - stdout

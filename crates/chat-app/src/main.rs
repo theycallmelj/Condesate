@@ -150,6 +150,12 @@ fn solo_services() -> Arc<condesate::GuardedServices> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Loads `.env` from the current or an ancestor directory if present;
+    // a no-op (not an error) when there isn't one, so this works whether
+    // you export PROVIDER/ANTHROPIC_API_KEY/OPENAI_API_KEY/MODEL yourself
+    // or keep them in `.env` (see `.env.example`).
+    dotenvy::dotenv().ok();
+
     let provider = choose_provider();
     let agent = BasicAgent::new(
         "assistant",
