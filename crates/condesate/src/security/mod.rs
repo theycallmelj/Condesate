@@ -14,9 +14,9 @@ pub mod identity;
 pub mod kernel;
 pub mod policy;
 
-pub use audit::{AuditEvent, AuditSink, Clock, MemoryAudit, Outcome, SystemClock};
-pub use identity::{Compatibility, GovernanceLabel, ModelClass, Principal, TenantId, TrustTier};
-pub use kernel::{AgentManifest, Admission, GuardedServices, Kernel, Refusal};
+pub use audit::{AuditEvent, AuditSink, Clock, FileAudit, MemoryAudit, Outcome, SystemClock, TracingAudit};
+pub use identity::{AgentUid, Compatibility, GovernanceLabel, ModelClass, Principal, TenantId, TrustTier};
+pub use kernel::{AgentInfo, AgentManifest, Admission, GuardedServices, Kernel, Refusal};
 pub use policy::{
     AccessRequest, Action, Decision, Effect, GrantSet, Obligation, Pattern, PolicyEngine, Resource,
     ResourcePattern, Rule, RuleSetPolicy, SubjectMatch, ToolBroker,

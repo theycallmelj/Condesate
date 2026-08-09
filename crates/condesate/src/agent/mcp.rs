@@ -40,11 +40,21 @@ impl McpConnection {
     /// Spawn `command` and complete the MCP initialize handshake with it.
     /// `server_name` is the namespace every tool it exposes is registered
     /// under (see the module docs).
+    ///
+    /// `inherit_stderr` controls whether the child's own stderr (its logs,
+    /// startup banners, panics) is passed through to this process's stderr
+    /// or discarded. This has to be set here rather than on `command`
+    /// directly: `rmcp`'s `TokioChildProcess::new` unconditionally
+    /// overwrites whatever stdio was already configured on `command`
+    /// (defaulting stderr to `Stdio::inherit()`), so going through its
+    /// `builder` — the only way to actually choose — is required.
     pub async fn connect_stdio(
         server_name: impl Into<String>,
         command: tokio::process::Command,
+        inherit_stderr: bool,
     ) -> Result<Arc<Self>> {
-        let transport = TokioChildProcess::new(command)?;
+        let stderr = if inherit_stderr { std::process::Stdio::inherit() } else { std::process::Stdio::null() };
+        let (transport, _stderr) = TokioChildProcess::builder(command).stderr(stderr).spawn()?;
         let client = ().serve(transport).await?;
         Ok(Arc::new(Self { server_name: server_name.into(), client }))
     }

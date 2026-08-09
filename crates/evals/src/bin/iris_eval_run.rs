@@ -107,7 +107,7 @@ async fn main() -> Result<()> {
     cmd.arg("--yes").arg("@iris-eval/mcp-server");
     println!("launching: npx --yes @iris-eval/mcp-server (stdio)\n");
 
-    let connection = McpConnection::connect_stdio(SERVER_NAME, cmd)
+    let connection = McpConnection::connect_stdio(SERVER_NAME, cmd, true)
         .await
         .context("failed to launch iris-eval mcp-server — is Node.js 20+ / npx available?")?;
 

@@ -18,8 +18,11 @@
 use super::policy::{Action, Decision, Obligation};
 use anyhow::Result;
 use async_trait::async_trait;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::fs::{File, OpenOptions};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 // ---------------------------------------------------------------------------
@@ -72,6 +75,10 @@ pub enum Outcome {
 /// stay readable years later, without resolving live objects.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrincipalRef {
+    /// Full [`super::identity::AgentUid`], stringified — the precise,
+    /// collision-proof identity. [`AuditEvent::summarize`] prints only its
+    /// first 8 characters; this field always has the whole thing.
+    pub uid: String,
     pub harness: String,
     pub agent: String,
     pub tenant: String,
@@ -82,6 +89,7 @@ pub struct PrincipalRef {
 impl From<&super::identity::Principal> for PrincipalRef {
     fn from(p: &super::identity::Principal) -> Self {
         Self {
+            uid: p.uid.to_string(),
             harness: p.harness.0.clone(),
             agent: p.agent.clone(),
             tenant: p.tenant.0.clone(),
@@ -124,11 +132,16 @@ impl AuditEvent {
             },
             Decision::Escalate { rule, to } => format!("ESCALATE[{rule}] -> {to:?}"),
         };
+        // First 8 chars of the uid, git-short-hash style — enough to tell
+        // two same-named instances apart at a glance; the full value lives
+        // in `self.principal.uid` for anything that needs precision.
+        let short_uid = &self.principal.uid[..8.min(self.principal.uid.len())];
         format!(
-            "#{} {} {} {:?} {} {} ({:?})",
+            "#{} {} {}/{} {:?} {} {} ({:?})",
             self.seq,
             self.at_ms,
             self.principal.agent,
+            short_uid,
             self.action,
             self.resource,
             verdict,
@@ -209,6 +222,38 @@ impl AuditSink for TracingAudit {
     }
 }
 
+/// Appends each record as one `summarize()` line to a file, then forwards to
+/// an inner sink. Unlike [`TracingAudit`], this survives past the process
+/// exiting — opens (creating if needed) once in append mode and keeps the
+/// handle for the sink's lifetime, so a crash mid-run still leaves every
+/// record written before it on disk.
+pub struct FileAudit {
+    file: Mutex<File>,
+    inner: Arc<dyn AuditSink>,
+}
+
+impl FileAudit {
+    pub async fn open(path: impl AsRef<Path>, inner: Arc<dyn AuditSink>) -> Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(path).await?;
+        Ok(Self { file: Mutex::new(file), inner })
+    }
+}
+
+#[async_trait]
+impl AuditSink for FileAudit {
+    async fn append(&self, event: AuditEvent) -> Result<()> {
+        let mut line = event.summarize();
+        line.push('\n');
+        self.file.lock().await.write_all(line.as_bytes()).await?;
+        self.inner.append(event).await
+    }
+
+    async fn flush(&self) -> Result<()> {
+        self.file.lock().await.flush().await?;
+        self.inner.flush().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::identity::{ModelClass, Principal, TenantId, TrustTier};
@@ -218,6 +263,7 @@ mod tests {
 
     fn principal() -> Principal {
         Principal {
+            uid: super::super::identity::AgentUid::new(),
             harness: HarnessId::new("w"),
             agent: "worker".into(),
             model_class: ModelClass {
@@ -230,6 +276,7 @@ mod tests {
             tenant: TenantId::new("acme"),
             trust: TrustTier::Sandboxed,
             parent: None,
+            parent_uid: None,
         }
     }
 
@@ -273,5 +320,30 @@ mod tests {
         let s = e.summarize();
         assert!(s.contains("DENY"), "{s}");
         assert!(s.contains("mem:proj/x"), "{s}");
+    }
+
+    #[tokio::test]
+    async fn file_audit_writes_one_summarize_line_per_event_and_still_forwards() {
+        let path = std::env::temp_dir().join(format!("condesate-file-audit-test-{}.log", std::process::id()));
+        let _ = tokio::fs::remove_file(&path).await;
+
+        let inner = MemoryAudit::new();
+        let sink = FileAudit::open(&path, inner.clone()).await.unwrap();
+        sink.append(event(1, Decision::Allow { rule: RuleId::new("r"), obligations: vec![] }))
+            .await
+            .unwrap();
+        sink.append(event(2, Decision::unmatched())).await.unwrap();
+        sink.flush().await.unwrap();
+
+        // Forwarded to the inner sink exactly like TracingAudit does.
+        assert_eq!(inner.events().await.len(), 2);
+
+        let contents = tokio::fs::read_to_string(&path).await.unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "{contents}");
+        assert!(lines[0].contains("ALLOW[r]"), "{}", lines[0]);
+        assert!(lines[1].contains("DENY"), "{}", lines[1]);
+
+        tokio::fs::remove_file(&path).await.unwrap();
     }
 }

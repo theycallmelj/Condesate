@@ -39,7 +39,9 @@
 //! extra one.
 
 use super::audit::{AuditEvent, AuditSink, Clock, Outcome, PrincipalRef};
-use super::identity::{Compatibility, GovernanceLabel, ModelClass, Principal, TenantId, TrustTier};
+use super::identity::{
+    AgentUid, Compatibility, GovernanceLabel, ModelClass, Principal, TenantId, TrustTier,
+};
 use super::policy::{
     AccessRequest, Action, Approver, Decision, DenyReason, GrantSet, Obligation, PolicyEngine,
     RequestContext, Resource, Rule, RuleId,
@@ -48,6 +50,7 @@ use crate::cache::{CacheRegistry, Candidate, Demand, ValueClass};
 use crate::swarm::service::ServiceHandle;
 use crate::types::HarnessId;
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -139,6 +142,31 @@ pub struct Admission {
 }
 
 // ---------------------------------------------------------------------------
+// The agent registry
+// ---------------------------------------------------------------------------
+
+/// One live agent, as the registry (and [`GuardedServices::list_agents`])
+/// sees it — a process-table row, not a credential. Denormalized from
+/// [`Principal`] at [`Kernel::attach`] time (the ATTACH step — see the
+/// module lifecycle diagram — is when a principal actually starts running,
+/// not merely ADMIT), and removed when its [`GuardedServices`] handle drops,
+/// so a snapshot always reflects who is *currently* running, not everyone
+/// who ever was.
+#[derive(Clone, Debug)]
+pub struct AgentInfo {
+    pub uid: AgentUid,
+    /// The readable role name — [`Principal::agent`].
+    pub name: String,
+    pub harness: HarnessId,
+    /// The uid of the principal that spawned this one, if any. See
+    /// [`Principal::parent_uid`].
+    pub parent: Option<AgentUid>,
+    pub tenant: TenantId,
+    pub trust: TrustTier,
+    pub spawned_at_ms: u64,
+}
+
+// ---------------------------------------------------------------------------
 // The kernel
 // ---------------------------------------------------------------------------
 
@@ -154,6 +182,11 @@ pub struct Kernel {
     root: GrantSet,
     seq: AtomicU64,
     epoch: AtomicU64,
+    /// Every currently-attached principal, keyed by uid. Not pluggable like
+    /// `audit`/`policy`/`cache` — this is kernel bookkeeping, not a decision
+    /// point a deployment would ever want to swap out. See
+    /// [`GuardedServices::list_agents`] for the permissioned read path.
+    agents: Mutex<HashMap<AgentUid, AgentInfo>>,
 }
 
 impl Kernel {
@@ -171,6 +204,7 @@ impl Kernel {
             root,
             seq: AtomicU64::new(0),
             epoch: AtomicU64::new(0),
+            agents: Mutex::new(HashMap::new()),
         })
     }
 
@@ -210,12 +244,14 @@ impl Kernel {
 
         Admission {
             principal: Principal {
+                uid: AgentUid::new(),
                 harness: manifest.harness.clone(),
                 agent: manifest.agent.clone(),
                 model_class: manifest.model_class.clone(),
                 tenant: manifest.tenant.clone(),
                 trust,
                 parent: parent.map(|p| p.principal.harness.clone()),
+                parent_uid: parent.map(|p| p.principal.uid),
             },
             grants: GrantSet { epoch: self.epoch(), ..granted },
             dropped,
@@ -224,8 +260,12 @@ impl Kernel {
 
     /// Step 3: wrap the raw syscall surface in the guard, carrying the
     /// admitted `GrantSet` with it so every check evaluates against exactly
-    /// what this principal holds.
+    /// what this principal holds. Also the moment this principal becomes
+    /// visible in the agent registry — see [`AgentInfo`] — since ADMIT alone
+    /// only computes what a principal *would* hold, not that it is actually
+    /// running.
     pub fn attach(self: &Arc<Self>, admission: &Admission, inner: ServiceHandle) -> GuardedServices {
+        self.register_agent(&admission.principal);
         GuardedServices {
             inner,
             principal: admission.principal.clone(),
@@ -235,6 +275,27 @@ impl Kernel {
             steps: AtomicU32::new(0),
             byte_budget: AtomicU64::new(0),
         }
+    }
+
+    fn register_agent(&self, principal: &Principal) {
+        let info = AgentInfo {
+            uid: principal.uid,
+            name: principal.agent.clone(),
+            harness: principal.harness.clone(),
+            parent: principal.parent_uid,
+            tenant: principal.tenant.clone(),
+            trust: principal.trust,
+            spawned_at_ms: self.clock.now_ms(),
+        };
+        self.agents.lock().expect("agents lock").insert(info.uid, info);
+    }
+
+    fn deregister_agent(&self, uid: AgentUid) {
+        self.agents.lock().expect("agents lock").remove(&uid);
+    }
+
+    fn agents_snapshot(&self) -> Vec<AgentInfo> {
+        self.agents.lock().expect("agents lock").values().cloned().collect()
     }
 
     fn next_seq(&self) -> u64 {
@@ -264,6 +325,18 @@ pub struct GuardedServices {
     activation: Mutex<String>,
     steps: AtomicU32,
     byte_budget: AtomicU64,
+}
+
+/// The registry counterpart of [`Kernel::attach`]'s registration: once the
+/// last handle for a principal goes away, it is no longer "currently
+/// running" and drops out of [`GuardedServices::list_agents`]. Automatic
+/// (RAII) rather than requiring every consumer to remember an explicit
+/// "terminate" call — `leader-search`'s `terminate_search_agent`, for
+/// instance, just drops its `SearchAgentHandle` and gets this for free.
+impl Drop for GuardedServices {
+    fn drop(&mut self) {
+        self.kernel.deregister_agent(self.principal.uid);
+    }
 }
 
 impl GuardedServices {
@@ -542,6 +615,59 @@ impl GuardedServices {
         let parent = Admission { principal: self.principal.clone(), grants: self.grants.clone(), dropped: vec![] };
         let child = self.kernel.admit(manifest, Some(&parent));
         Ok(self.kernel.attach(&child, raw))
+    }
+
+    // -- introspection --------------------------------------------------
+
+    /// List every currently-running agent this principal may see.
+    ///
+    /// Two visibilities compose here, deliberately unevenly:
+    ///
+    /// * **Structural** — always itself, and always every live descendant it
+    ///   spawned, directly or transitively. This is not a grant: it cannot be
+    ///   requested in a manifest and no rule can revoke it, the same way a
+    ///   child can never outrank the parent that spawned it. A principal
+    ///   that was already allowed to *create* a child (`Action::Spawn`, in
+    ///   `spawn_child`) does not need a second grant just to know the child
+    ///   exists.
+    /// * **Granted** — anything else, gated on `Action::Read` against
+    ///   `Resource::Agent { agent }` exactly like any other read, matched by
+    ///   the target's *role name* (never its uid, which cannot appear in a
+    ///   rule authored before that instance is ever admitted).
+    ///
+    /// Every candidate still goes through [`Self::check`] — including
+    /// structurally-visible ones — so the epoch-staleness guard applies
+    /// uniformly and every decision lands on the audit trail, including the
+    /// default-deny a structural entry silently overrides. An *explicit* deny
+    /// on `Resource::Agent` still wins even for a descendant: structural
+    /// visibility overrides the absence of a rule, not a rule that says no.
+    pub async fn list_agents(&self) -> Result<Vec<AgentInfo>> {
+        let all = self.kernel.agents_snapshot();
+        let parents: HashMap<AgentUid, Option<AgentUid>> =
+            all.iter().map(|a| (a.uid, a.parent)).collect();
+        let is_descendant_of_me = |uid: AgentUid| -> bool {
+            let mut cur = uid;
+            while let Some(Some(p)) = parents.get(&cur) {
+                if *p == self.principal.uid {
+                    return true;
+                }
+                cur = *p;
+            }
+            false
+        };
+
+        let mut visible = Vec::with_capacity(all.len());
+        for info in all {
+            let structural = info.uid == self.principal.uid || is_descendant_of_me(info.uid);
+            match self.check(Action::Read, &Resource::Agent { agent: info.name.clone() }).await {
+                Ok(_) => visible.push(info),
+                Err(Refusal::Denied(Denied { reason: DenyReason::NoMatchingRule, .. })) if structural => {
+                    visible.push(info);
+                }
+                Err(_) => {} // explicit deny, escalation, or stale epoch: stays hidden
+            }
+        }
+        Ok(visible)
     }
 }
 
@@ -869,5 +995,124 @@ mod tests {
             .await
             .err().unwrap();
         assert!(matches!(err, Refusal::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn every_admission_gets_a_distinct_uid_even_with_the_same_agent_name() {
+        let (kernel, _) = kernel_with(root());
+        let first = kernel.admit(&manifest("search", TrustTier::Standard, vec![]), None);
+        let second = kernel.admit(&manifest("search", TrustTier::Standard, vec![]), None);
+        assert_ne!(first.principal.uid, second.principal.uid);
+        assert_eq!(first.principal.agent, second.principal.agent);
+    }
+
+    #[tokio::test]
+    async fn audit_events_carry_the_acting_principals_uid() {
+        let (kernel, audit) = kernel_with(root());
+        let adm = kernel.admit(&manifest("worker", TrustTier::Standard, vec![scratch_rw("worker")]), None);
+        let svc = kernel.attach(&adm, services("worker"));
+        svc.storage_set("scratch/a", "1").await.unwrap();
+
+        let event = audit.events().await.pop().unwrap();
+        assert_eq!(event.principal.uid, adm.principal.uid.to_string());
+        assert!(!event.principal.uid.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_agents_always_includes_self_with_no_grant_at_all() {
+        let (kernel, _) = kernel_with(GrantSet::default()); // no rules whatsoever
+        let adm = kernel.admit(&manifest("worker", TrustTier::Standard, vec![]), None);
+        let svc = kernel.attach(&adm, services("worker"));
+
+        let seen = svc.list_agents().await.unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].uid, adm.principal.uid);
+        assert_eq!(seen[0].name, "worker");
+    }
+
+    #[tokio::test]
+    async fn list_agents_sees_a_spawned_child_but_not_an_unrelated_top_level_agent() {
+        let root_grants = GrantSet::new(vec![spawn_rule("leader", "search")]);
+        let (kernel, _) = kernel_with(root_grants);
+        let leader_adm =
+            kernel.admit(&manifest("leader", TrustTier::Standard, vec![spawn_rule("leader", "search")]), None);
+        let leader = kernel.attach(&leader_adm, services("leader"));
+
+        let search = leader
+            .spawn_child(&manifest("search", TrustTier::Standard, vec![]), services("search"))
+            .await
+            .unwrap();
+        // Admitted directly against the kernel's root, not spawned by
+        // `leader` — a sibling with no relationship at all.
+        let stranger_adm = kernel.admit(&manifest("stranger", TrustTier::Standard, vec![]), None);
+        let _stranger = kernel.attach(&stranger_adm, services("stranger"));
+
+        let mut seen: Vec<String> =
+            leader.list_agents().await.unwrap().into_iter().map(|a| a.name).collect();
+        seen.sort();
+        assert_eq!(seen, vec!["leader".to_string(), "search".to_string()]);
+
+        // The child sees only itself — it has no descendants and did not
+        // spawn its own parent.
+        let child_seen: Vec<String> =
+            search.list_agents().await.unwrap().into_iter().map(|a| a.name).collect();
+        assert_eq!(child_seen, vec!["search".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_agents_respects_an_explicit_grant_for_a_non_descendant() {
+        let root_grants = GrantSet::new(vec![Rule::allow(
+            "see-stranger",
+            SubjectMatch::agent("watcher"),
+            &[Action::Read],
+            ResourcePattern::Agent(Pattern::parse("stranger")),
+        )]);
+        let (kernel, _) = kernel_with(root_grants);
+        let watcher_adm = kernel.admit(
+            &manifest(
+                "watcher",
+                TrustTier::Standard,
+                vec![Rule::allow(
+                    "see-stranger",
+                    SubjectMatch::agent("watcher"),
+                    &[Action::Read],
+                    ResourcePattern::Agent(Pattern::parse("stranger")),
+                )],
+            ),
+            None,
+        );
+        let watcher = kernel.attach(&watcher_adm, services("watcher"));
+        let stranger_adm = kernel.admit(&manifest("stranger", TrustTier::Standard, vec![]), None);
+        let _stranger = kernel.attach(&stranger_adm, services("stranger"));
+        let _other_adm_handle = kernel.attach(
+            &kernel.admit(&manifest("also-unseen", TrustTier::Standard, vec![]), None),
+            services("also-unseen"),
+        );
+
+        let mut seen: Vec<String> = watcher.list_agents().await.unwrap().into_iter().map(|a| a.name).collect();
+        seen.sort();
+        // "watcher" (self, structural) and "stranger" (explicit grant) are
+        // visible; "also-unseen" never got a rule and stays hidden.
+        assert_eq!(seen, vec!["stranger".to_string(), "watcher".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_agents_drops_an_agent_once_its_handle_is_dropped() {
+        let root_grants = GrantSet::new(vec![spawn_rule("leader", "search")]);
+        let (kernel, _) = kernel_with(root_grants);
+        let leader_adm =
+            kernel.admit(&manifest("leader", TrustTier::Standard, vec![spawn_rule("leader", "search")]), None);
+        let leader = kernel.attach(&leader_adm, services("leader"));
+
+        let search = leader
+            .spawn_child(&manifest("search", TrustTier::Standard, vec![]), services("search"))
+            .await
+            .unwrap();
+        assert_eq!(leader.list_agents().await.unwrap().len(), 2);
+
+        drop(search);
+        let seen = leader.list_agents().await.unwrap();
+        assert_eq!(seen.len(), 1, "the terminated child should no longer be listed");
+        assert_eq!(seen[0].name, "leader");
     }
 }

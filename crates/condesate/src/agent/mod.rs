@@ -11,6 +11,7 @@
 //! | [`tool`] | `Tool` and the built-in tools |
 //! | [`mcp`] (feature `mcp`) | `McpConnection` / `McpTool` — tools proxied over the MCP protocol |
 //! | [`prompted_tools`] | `PromptedToolModel` — prompted tool-calling for providers with no native tool-use wire format yet |
+//! | [`repl`] | `run_repl` — the turn-by-turn console driver shared by the demo binaries |
 
 pub mod core;
 pub mod loops;
@@ -20,6 +21,7 @@ pub mod model;
 pub mod prompted_tools;
 #[cfg(feature = "remote")]
 pub mod remote;
+pub mod repl;
 pub mod tool;
 /// Pure provider request/response mapping (always compiled + tested).
 pub mod wire;
@@ -32,4 +34,5 @@ pub use model::{CloudModel, LocalModel, ModelProvider};
 pub use prompted_tools::{tool_instructions, PromptedToolModel};
 #[cfg(feature = "remote")]
 pub use remote::{AnthropicModel, OpenAiModel};
+pub use repl::{run_repl, ReplOnError, ReplOptions};
 pub use tool::{Remember, SendMessage, ShutdownSwarm, Tool, WordCount};

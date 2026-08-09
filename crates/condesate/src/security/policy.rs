@@ -94,6 +94,11 @@ pub enum Resource {
     Spawn { agent: String },
     /// Swarm-wide lifecycle.
     Swarm,
+    /// A live agent's registry record, named by its role — see
+    /// `super::kernel::AgentInfo`. Never named by uid: a rule is authored
+    /// before the instance it might match exists, so only the stable role
+    /// name can appear in a pattern.
+    Agent { agent: String },
 }
 
 impl Resource {
@@ -110,6 +115,7 @@ impl Resource {
             Resource::Model { class } => format!("model:{class}"),
             Resource::Spawn { agent } => format!("spawn:{agent}"),
             Resource::Swarm => "swarm".to_string(),
+            Resource::Agent { agent } => format!("agent:{agent}"),
         }
     }
 }
@@ -208,6 +214,7 @@ pub enum ResourcePattern {
     Model(ModelClassPattern),
     Spawn(Pattern),
     Swarm,
+    Agent(Pattern),
 }
 
 impl ResourcePattern {
@@ -224,6 +231,7 @@ impl ResourcePattern {
             (ResourcePattern::Model(cp), Resource::Model { class }) => cp.matches(class),
             (ResourcePattern::Spawn(p), Resource::Spawn { agent }) => p.matches(agent),
             (ResourcePattern::Swarm, Resource::Swarm) => true,
+            (ResourcePattern::Agent(p), Resource::Agent { agent }) => p.matches(agent),
             _ => false,
         }
     }
@@ -243,6 +251,7 @@ impl ResourcePattern {
             (ResourcePattern::Model(a), ResourcePattern::Model(b)) => a.contains(b),
             (ResourcePattern::Spawn(a), ResourcePattern::Spawn(b)) => a.contains(b),
             (ResourcePattern::Swarm, ResourcePattern::Swarm) => true,
+            (ResourcePattern::Agent(a), ResourcePattern::Agent(b)) => a.contains(b),
             _ => false,
         }
     }
@@ -799,12 +808,14 @@ mod tests {
 
     fn principal(agent: &str, trust: TrustTier) -> Principal {
         Principal {
+            uid: super::super::identity::AgentUid::new(),
             harness: HarnessId::new(agent),
             agent: agent.to_string(),
             model_class: class(),
             tenant: TenantId::new("acme"),
             trust,
             parent: None,
+            parent_uid: None,
         }
     }
 

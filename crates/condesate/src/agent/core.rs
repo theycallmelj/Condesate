@@ -20,11 +20,18 @@ pub struct AgentContext {
     /// The guarded syscall surface available to tools — storage, bus,
     /// identity, all subject to whatever this principal was admitted with.
     pub services: Arc<GuardedServices>,
+    /// When true, `AgentLoop` impls in `loops.rs` echo their internal
+    /// reasoning (each think-step, each tool call and observation) to
+    /// stderr. Off by default: that trace is a debugging aid, not part of
+    /// an agent's actual reply, and a caller driving a user-facing chat
+    /// (e.g. `run_repl`) should not have to see one agent's internals just
+    /// because it happens to be calling another agent through a tool.
+    pub trace: bool,
 }
 
 impl AgentContext {
     pub fn new(services: Arc<GuardedServices>) -> Self {
-        Self { transcript: Vec::new(), services }
+        Self { transcript: Vec::new(), services, trace: false }
     }
 }
 

@@ -1,8 +1,8 @@
 //! A minimal terminal chat app built on the `condesate` library.
 //!
 //! Demonstrates the consumer pattern: pick a `ModelProvider`, wrap it in a
-//! `BasicAgent`, and drive a `SingleShot` loop turn-by-turn while keeping a
-//! persistent transcript.
+//! `BasicAgent`, and drive it turn-by-turn with `condesate::run_repl`, which
+//! owns the stdin loop and the persistent transcript.
 //!
 //! Offline by default (an echo provider) so it always runs. Build with the
 //! `remote` feature for real OpenAI / Anthropic connectivity:
@@ -13,14 +13,12 @@
 //!
 //! Type a message and press enter; `exit` / `quit` / Ctrl-D leaves.
 
-use std::io::Write;
 use std::sync::Arc;
 
 use condesate::{
-    Agent, AgentContext, AgentLoop, AgentManifest, BasicAgent, Bus, CompletionRequest,
-    CompletionResponse, GrantSet, HarnessId, Kernel, MemoryAudit, Message, ModelClass,
-    ModelProvider, Role, RuleSetPolicy, ServiceHandle, SingleShot, Storage, SystemClock, TenantId,
-    TrustTier,
+    run_repl, Agent, AgentManifest, BasicAgent, Bus, CompletionRequest, CompletionResponse,
+    GrantSet, HarnessId, Kernel, MemoryAudit, ModelClass, ModelProvider, ReplOnError, ReplOptions,
+    Role, RuleSetPolicy, ServiceHandle, SingleShot, Storage, SystemClock, TenantId, TrustTier,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -163,43 +161,23 @@ async fn main() -> Result<()> {
         provider,
         vec![], // no tools in the basic chat flow
     );
-    let loop_strategy = SingleShot;
     let services = solo_services();
 
-    // Persistent transcript across turns — the "chat flow" state.
-    let mut transcript: Vec<Message> = Vec::new();
-
-    println!("chat ready — type a message, or 'exit' to quit.\n");
-    let stdin = std::io::stdin();
-    loop {
-        print!("you> ");
-        std::io::stdout().flush().ok();
-
-        let mut line = String::new();
-        let n = stdin.read_line(&mut line)?;
-        if n == 0 {
-            break; // EOF (Ctrl-D)
-        }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line == "exit" || line == "quit" {
-            break;
-        }
-
-        // One turn: fresh context seeded with the running transcript + the new
-        // user message; the loop produces a reply; then we persist both.
-        let mut ctx = AgentContext::new(services.clone());
-        ctx.transcript = transcript.clone();
-        ctx.transcript.push(Message::user(line.to_string()));
-
-        let outcome = loop_strategy.run(&agent as &dyn Agent, &mut ctx).await?;
-        println!("bot> {}\n", outcome.final_text);
-
-        transcript.push(Message::user(line.to_string()));
-        transcript.push(Message::assistant(outcome.final_text));
-    }
+    run_repl(
+        &agent as &dyn Agent,
+        &SingleShot,
+        services,
+        std::io::stdin().lock(),
+        ReplOptions {
+            greeting: "chat ready — type a message, or 'exit' to quit.".into(),
+            reply_prefix: "bot> ".into(),
+            on_error: ReplOnError::Abort,
+            // No tools in the basic chat flow, so there'd be nothing to
+            // trace anyway.
+            trace: false,
+        },
+    )
+    .await?;
 
     println!("bye.");
     Ok(())

@@ -53,10 +53,17 @@ async fn execute_tools(
             },
             None => format!("no such tool: '{}'", call.name),
         };
-        println!(
-            "      ↳ tool {}({}) -> {observation}",
-            call.name, call.args
-        );
+        // Gated on `ctx.trace` (default off) and, when shown, on stderr —
+        // this is internal reasoning trace, not the agent's own reply, so it
+        // must never land where a caller's user-facing output goes (e.g. a
+        // REPL's `you>` / `leader>` lines on stdout), the same reason
+        // `TracingAudit` mirrors to stderr instead of stdout.
+        if ctx.trace {
+            eprintln!(
+                "      ↳ tool {}({}) -> {observation}",
+                call.name, call.args
+            );
+        }
         ctx.transcript.push(Message::tool(observation));
     }
     Ok(())
@@ -96,7 +103,9 @@ impl AgentLoop for ReActLoop {
             steps += 1;
             let resp = agent.think(ctx).await?;
             last_text = resp.content.clone();
-            println!("      · step {steps}: {}", resp.content);
+            if ctx.trace {
+                eprintln!("      · step {steps}: {}", resp.content); // see the trace note in execute_tools
+            }
             ctx.transcript.push(Message::assistant(resp.content));
 
             if resp.tool_calls.is_empty() {

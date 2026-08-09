@@ -23,6 +23,9 @@ crates/evals/.venv
 .env.*
 !.env.example
 
+# leader-search's AUDIT_LOG_PATH default (see .env.example)
+/audit.log
+
 # OS / editor cruft
 .DS_Store
 *.swp

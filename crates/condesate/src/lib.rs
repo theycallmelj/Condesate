@@ -63,9 +63,9 @@ pub mod types;
 // Convenient flat re-exports — the public API shape is unaffected by which
 // folder a module physically lives in.
 pub use agent::{
-    tool_instructions, Agent, AgentContext, AgentLoop, BasicAgent, CloudModel, LocalModel,
-    LoopOutcome, ModelProvider, PromptedToolModel, ReActLoop, Remember, SendMessage, ShutdownSwarm,
-    SingleShot, Tool, WordCount,
+    run_repl, tool_instructions, Agent, AgentContext, AgentLoop, BasicAgent, CloudModel,
+    LocalModel, LoopOutcome, ModelProvider, PromptedToolModel, ReActLoop, Remember, ReplOnError,
+    ReplOptions, SendMessage, ShutdownSwarm, SingleShot, Tool, WordCount,
 };
 #[cfg(feature = "remote")]
 pub use agent::{AnthropicModel, OpenAiModel};
@@ -79,10 +79,11 @@ pub use faraday::{
     RetrievalSheet, SheetComposer, Slip, SlipIndex, Speculation, StandardComposer,
 };
 pub use security::{
-    AccessRequest, Action, AgentManifest, Admission, AuditEvent, AuditSink, Clock, Compatibility,
-    Decision, Effect, GovernanceLabel, GrantSet, GuardedServices, Kernel, MemoryAudit, ModelClass,
-    Obligation, Outcome, Pattern, PolicyEngine, Principal, Refusal, Resource, ResourcePattern, Rule,
-    RuleSetPolicy, SubjectMatch, SystemClock, TenantId, ToolBroker, TrustTier,
+    AccessRequest, Action, AgentInfo, AgentManifest, AgentUid, Admission, AuditEvent, AuditSink,
+    Clock, Compatibility, Decision, Effect, FileAudit, GovernanceLabel, GrantSet, GuardedServices,
+    Kernel, MemoryAudit, ModelClass, Obligation, Outcome, Pattern, PolicyEngine, Principal,
+    Refusal, Resource, ResourcePattern, Rule, RuleSetPolicy, SubjectMatch, SystemClock, TenantId,
+    ToolBroker, TracingAudit, TrustTier,
 };
 pub use swarm::{
     Bus, Envelope, Harness, Inbox, InMemoryStorage, Payload, Recipient, ServiceHandle,

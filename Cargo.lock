@@ -119,6 +119,7 @@ dependencies = [
  "rmcp",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

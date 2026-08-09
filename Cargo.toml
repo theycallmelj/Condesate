@@ -7,7 +7,8 @@ edition = "2021"
 version = "0.1.0"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "io-util", "net", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "io-util", "net", "process", "fs"] }
 async-trait = "0.1"
 anyhow = "1"
 serde_json = "1"
+uuid = { version = "1", features = ["v4"] }

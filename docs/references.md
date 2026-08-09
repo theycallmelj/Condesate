@@ -121,9 +121,13 @@ this codebase goes through. See `crates/evals/README.md` §5.
 **Cooperiano. `mcp-duckduckgo`.** <https://github.com/Cooperiano/duckduckgo-mcp>
 (npm package `mcp-duckduckgo`) A real, free, no-API-key web-search MCP
 server (`search`, `search_and_crawl`, `research`, `fetch`). `search_agent.rs`
-spawns it via `npx` and reaches its `search` tool through the same
-`condesate::McpConnection` client used above — the search agent's *only*
-granted tool. Chosen after checking several npm candidates for the same
-"is this real and actually installable" bar applied to the eval
-integrations; `@modelcontextprotocol/server-brave-search` (the official
-alternative) is deprecated and needs an API key besides.
+spawns it via `npx` and reaches three of its four tools —
+`search`/`search_and_crawl`/`fetch` — through the same
+`condesate::McpConnection` client used above. Chosen after checking several
+npm candidates for the same "is this real and actually installable" bar
+applied to the eval integrations; `@modelcontextprotocol/server-brave-search`
+(the official alternative) is deprecated and needs an API key besides.
+`research`, the fourth tool, is deliberately not granted — live testing
+found a real panic in its own Go implementation that kills the whole server
+process and poisons every other tool call on the same connection; see
+`search_agent.rs`'s module docs.

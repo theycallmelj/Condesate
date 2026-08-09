@@ -18,6 +18,7 @@
 //! Nothing here performs a check. [`super::policy`] does that.
 
 use std::fmt;
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Trust
@@ -183,12 +184,51 @@ pub enum Compatibility {
 // Principal
 // ---------------------------------------------------------------------------
 
+/// Identifies one *admission* — one running instance of an agent — uniquely.
+///
+/// Distinct from [`Principal::agent`] (the readable role name, e.g.
+/// `"search"`, reused every time that role is admitted) and
+/// [`Principal::harness`] (the routing address). Minted fresh by
+/// [`super::kernel::Kernel::admit`], so a role spawned, terminated, and
+/// spawned again never collides with its earlier self in the agent registry
+/// or the audit trail, even though its name and harness id are identical
+/// both times.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AgentUid(pub Uuid);
+
+impl AgentUid {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// First 8 hex characters — the form [`super::audit::AuditEvent::summarize`]
+    /// prints, the same convention as a git short hash. The full value is
+    /// always available via `.0` (or [`fmt::Display`]) when precision matters.
+    pub fn short(&self) -> String {
+        self.0.simple().to_string()[..8].to_string()
+    }
+}
+
+impl Default for AgentUid {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for AgentUid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// The subject of an access check: a running harness plus its credentials.
 ///
 /// Built by the kernel at spawn time (see [`super::kernel`]); never constructed
 /// by an agent or a tool, because a principal that can name itself can lie.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Principal {
+    /// Unique to this admission — see [`AgentUid`].
+    pub uid: AgentUid,
     /// Which process this is. Matches the bus routing address.
     pub harness: crate::types::HarnessId,
     /// The agent role running inside it — what rules usually match on.
@@ -202,6 +242,12 @@ pub struct Principal {
     /// Who spawned this principal, if anyone. Grants may only ever be a subset
     /// of the parent's — see [`super::policy::GrantSet::attenuate`].
     pub parent: Option<crate::types::HarnessId>,
+    /// The spawning principal's own [`AgentUid`], if any — the precise,
+    /// collision-proof edge [`super::kernel::GuardedServices::list_agents`]
+    /// walks to decide descendant visibility. `parent` above is kept
+    /// alongside this for display/routing; this field is what structural
+    /// checks actually use.
+    pub parent_uid: Option<AgentUid>,
 }
 
 impl fmt::Display for Principal {
