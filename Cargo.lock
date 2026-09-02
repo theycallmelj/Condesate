@@ -663,6 +663,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mnemosyne"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "condesate",
+ "dotenvy",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "nix"
 version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

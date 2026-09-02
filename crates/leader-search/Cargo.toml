@@ -9,7 +9,7 @@ name = "leader-search"
 path = "src/main.rs"
 
 [dependencies]
-condesate = { path = "../condesate", features = ["mcp", "remote"] }
+condesate = { path = "../condesate", features = ["mcp", "remote", "a2a"] }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }

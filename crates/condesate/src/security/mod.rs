@@ -18,6 +18,6 @@ pub use audit::{AuditEvent, AuditSink, Clock, FileAudit, MemoryAudit, Outcome, S
 pub use identity::{AgentUid, Compatibility, GovernanceLabel, ModelClass, Principal, TenantId, TrustTier};
 pub use kernel::{AgentInfo, AgentManifest, Admission, GuardedServices, Kernel, Refusal};
 pub use policy::{
-    AccessRequest, Action, Decision, Effect, GrantSet, Obligation, Pattern, PolicyEngine, Resource,
-    ResourcePattern, Rule, RuleSetPolicy, SubjectMatch, ToolBroker,
+    AccessRequest, Action, Condition, Decision, Effect, GrantSet, Obligation, Pattern, PolicyEngine,
+    Resource, ResourcePattern, Rule, RuleSetPolicy, SubjectMatch, ToolBroker,
 };

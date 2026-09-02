@@ -1,9 +1,11 @@
 # leader-search
 
-A two-agent demo built on `condesate`: a **leader** that can dynamically
-spawn and terminate a **search** agent, which does real web searches
-through a real MCP server. Both agents share the same live model, picked
-from `.env`.
+A multi-agent demo built on `condesate`: a **leader** that can dynamically
+spawn and terminate a **search** agent, which does real web searches through
+a real MCP server, and can also talk directly to **external agents hosted on
+other sites** over the real
+[A2A ("Agent2Agent")](https://a2a-protocol.org/) protocol. Every agent
+involved shares the same live model, picked from `.env`.
 
 ```bash
 cargo run -p leader-search
@@ -17,6 +19,8 @@ Needs:
 - Node.js 20+ (the search agent spawns
   [`mcp-duckduckgo`](https://github.com/Cooperiano/duckduckgo-mcp) via
   `npx` — free, no API key, no signup).
+- Network access to whatever site you point `discover_a2a_agent` at, if you
+  use it — it's a plain outbound HTTPS client, nothing to install.
 
 Ask it something that needs current information ("what's the latest stable
 Rust release?") and watch it: spawn the search agent, delegate the query,
@@ -25,6 +29,16 @@ then — if you ask a follow-up — go back to the *same* search agent
 conversation rather than starting cold. Say goodbye or change topics and it
 tears the search agent back down. Ask it something it can just answer
 (simple facts, conversation) and it won't bother spawning anything.
+
+Point it at a site that hosts its own agent ("there's an agent at
+https://example.com — ask it what it can do") and it takes a different path:
+`discover_a2a_agent` fetches that site's agent card (name, description,
+skills, the actual endpoint to message), then `send_a2a_message` sends it one
+message over real JSON-RPC and relays the reply — no spawning, no child
+principal, just an outbound call under the leader's own tool grant. See
+[`crates/condesate/src/agent/a2a.rs`](../condesate/src/agent/a2a.rs) for the
+client and [`src/main.rs`](src/main.rs)'s system prompt for how the leader
+decides between this and the search agent.
 
 By default, stdout carries only the chat itself (greeting, `you>`/`leader>`
 lines, `bye.`) and stderr carries a few one-line diagnostics — nothing about
@@ -85,19 +99,47 @@ permission check as `audit #N ...` with a summary count at the end — see
   `condesate::PromptedToolModel`'s doc comment for the tool-result framing
   bug this had to work around (a bare tool result like `"4"` is
   indistinguishable from a new user message unless explicitly marked).
-- **Defense in depth on termination** — `terminate_search_agent` checks
-  `Action::Control` on `Resource::Peer { id: "search" }` *in addition to*
-  the ordinary tool-invoke gate every tool call already goes through — the
-  same two-layer pattern `ShutdownSwarm` uses internally for
+- **Defense in depth on termination** — `terminate_search_agent` calls
+  `GuardedServices::send_shutdown`, which checks `Action::Control` on
+  `Resource::Peer { id: "search" }` *in addition to* the ordinary
+  tool-invoke gate every tool call already goes through — the same
+  two-layer pattern `ShutdownSwarm` uses internally for
   `broadcast_shutdown`.
-- **The answer is handed off through shared storage, not a bare return
-  value.** The search agent's `ReActLoop::run` result is written with its
-  own `storage_set("search/result", ...)`, under a grant scoped to
-  `search/*` and nothing else; the leader then reads the same key back with
-  its own `storage_get`, under a separately-requested grant. Two
-  independently-checked, independently-audited crossings of the permission
-  boundary, not one direct function-call return threading the answer
-  straight through — see `AskSearchAgent::call` in `search_agent.rs`.
+- **Real agent-to-agent messaging over `condesate::swarm::Bus`, not an
+  in-process function call.** Spawning the search agent starts it as its own
+  tokio task running [`run_search_actor`](src/search_agent.rs) — a genuine
+  inbox consumer, the same shape a `StandardHarness` runs inside a `Swarm`,
+  just registered onto the bus dynamically (`Bus::insert_route`) since the
+  search agent doesn't exist yet when the leader boots and so can't be in a
+  `Swarm`'s fixed roster from the start. `ask_search_agent` sends the query
+  as a real `Payload::Task` (`GuardedServices::send_task`, checked against
+  the leader's own `Action::Send` grant) and blocks on the leader's *own*
+  inbox for the search agent's `Payload::Reply` — two independently-checked,
+  independently-audited crossings of the permission boundary, not one direct
+  `ReActLoop::run` call reaching into the search agent's private state. The
+  search agent's transcript now lives inside its actor loop, carried across
+  `Payload::Task` messages, so a follow-up question still has earlier
+  findings in context. The answer is *also* written to shared storage
+  (`storage_set("search/result", ...)`, under the search agent's own
+  `search/*`-scoped grant) as a second, independently-audited record of the
+  same answer — see `run_search_actor` and `AskSearchAgent::call` in
+  `search_agent.rs`.
+- **Real A2A protocol client — agent cards and JSON-RPC, not a mock.**
+  `discover_a2a_agent` fetches a site's agent card (trying both the current
+  `/.well-known/agent-card.json` and the earlier draft's
+  `/.well-known/agent.json`, since both are seen on real, live agents) and
+  `send_a2a_message` sends a `message/send` JSON-RPC 2.0 request to the
+  endpoint the card names, over a real `reqwest` HTTP client. Both go through
+  the *ordinary* `Action::Invoke`/`Resource::Tool` gate every tool call
+  already goes through — no A2A-specific permission check, the same reasoning
+  `condesate::agent::mcp` uses for MCP tools: a parallel gate is a gate that
+  can drift out of sync with the real one. Unlike the search agent, there's
+  no spawned child principal here at all — the leader talks to the remote
+  agent directly, the same way it'd call any other tool. See
+  `condesate::agent::a2a` for the client (client-only: it reaches agents
+  other people host, it doesn't serve one) and its own module docs for what's
+  deliberately out of scope (streaming, push notifications, task
+  cancellation, auth beyond plain HTTPS).
 
 ## Where's the audit log
 
@@ -134,14 +176,6 @@ diagnostics to stderr.
 
 ## What isn't real (known simplifications)
 
-- **No bus/inbox messaging between the two agents.** The leader doesn't run
-  the search agent as a `Harness` with its own inbox loop; asking it
-  something is still a direct, in-process `ReActLoop::run` *call* against the
-  search agent's own `BasicAgent` and its own `GuardedServices` (only the
-  *answer* travels back through storage, as above). `condesate::swarm::Bus`
-  (the actual IPC layer `Swarm` uses) isn't touched at all here — there was
-  no need to make its routing table mutable at runtime for this app, since
-  nothing addresses the search agent by `HarnessId` over the bus.
 - **"Terminate" doesn't revoke.** `condesate::Kernel::revoke_all()` bumps
   one epoch shared by the *whole* kernel — there's no way to invalidate just
   the search agent's `GuardedServices` without also staling out the

@@ -23,14 +23,16 @@ mod search_agent;
 
 use anyhow::Result;
 use condesate::{
-    run_repl, Action, AgentManifest, AuditSink, BasicAgent, Bus, FileAudit, GrantSet,
-    GuardedServices, HarnessId, InMemoryStorage, Kernel, MemoryAudit, ModelClass, Pattern,
-    ReActLoop, ReplOnError, ReplOptions, ResourcePattern, Rule, RuleSetPolicy, ServiceHandle,
-    Storage, SubjectMatch, SystemClock, TenantId, Tool, ToolSpec, TracingAudit, TrustTier,
+    run_repl, Action, AgentManifest, AuditSink, BasicAgent, Bus, DiscoverA2aAgent, FileAudit,
+    GrantSet, GuardedServices, HarnessId, Inbox, InMemoryStorage, Kernel, MemoryAudit, ModelClass,
+    Pattern, ReActLoop, ReplOnError, ReplOptions, ResourcePattern, Rule, RuleSetPolicy,
+    SendA2aMessage, ServiceHandle, Storage, SubjectMatch, SystemClock, TenantId, Tool, ToolSpec,
+    TracingAudit, TrustTier,
 };
 use search_agent::{AskSearchAgent, ListAgents, Registry, SpawnSearchAgent, TerminateSearchAgent};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
 
 const LEADER_ID: &str = "leader";
 const SEARCH_ID: &str = "search";
@@ -63,6 +65,19 @@ fn root_grants() -> Vec<Rule> {
             &[Action::Control],
             ResourcePattern::Peer(Pattern::parse(SEARCH_ID)),
         ),
+        // Default subject + any peer, deliberately, same trick as
+        // `search-result-mem` below: one root grant covers both the
+        // leader's own `send_task("search", ...)` and — via attenuation in
+        // `spawn_child` — the search agent's much narrower
+        // `send_reply("leader", ...)` (see `search_agent.rs`'s
+        // `reply-to-leader` rule). This is what makes `ask_search_agent` a
+        // real bus round-trip instead of an in-process function call.
+        Rule::allow(
+            "bus-messaging",
+            SubjectMatch::default(),
+            &[Action::Send],
+            ResourcePattern::Peer(Pattern::Any),
+        ),
         Rule::allow(
             "search-result-mem",
             SubjectMatch::default(),
@@ -86,6 +101,7 @@ fn root_grants() -> Vec<Rule> {
 /// a normal run's stderr carries only a handful of one-line diagnostics.
 async fn build_leader_services(
     storage: Arc<dyn Storage>,
+    bus: Bus,
     verbose: bool,
 ) -> Result<(Arc<GuardedServices>, Arc<MemoryAudit>)> {
     let grants = root_grants();
@@ -103,7 +119,7 @@ async fn build_leader_services(
         me: HarnessId::new(LEADER_ID),
         roster: Arc::new(vec![HarnessId::new(LEADER_ID), HarnessId::new(SEARCH_ID)]),
         storage,
-        bus: Bus::new(HashMap::new()),
+        bus,
     };
     let manifest = AgentManifest {
         harness: HarnessId::new(LEADER_ID),
@@ -128,20 +144,30 @@ async fn build_leader_services(
 
 fn leader_system_prompt(tool_specs: &[ToolSpec]) -> String {
     format!(
-        "You are the leader of a small two-agent system. You have no web search of your own — a \
-         separate search agent does, over a real connection to a search server. Rules:\n\
-         - If the user asks something that needs current or external information, call \
-           spawn_search_agent (skip this if it's already running), then call ask_search_agent \
-           with one focused query, then answer the user using what it found. The search agent \
-           remembers your conversation with it — if its answer is thin or you need more detail \
-           on something it mentioned, call ask_search_agent again with a follow-up instead of \
-           re-asking the same question from scratch.\n\
+        "You are the leader of a small multi-agent system. You have no web search of your own — a \
+         separate search agent does, over a real connection to a search server — and no built-in \
+         knowledge of any specific site's own agent. Rules:\n\
+         - If the user asks something that needs current or general external information (not \
+           tied to one specific site), call spawn_search_agent (skip this if it's already \
+           running), then call ask_search_agent with one focused query, then answer the user \
+           using what it found. The search agent remembers your conversation with it — if its \
+           answer is thin or you need more detail on something it mentioned, call \
+           ask_search_agent again with a follow-up instead of re-asking the same question from \
+           scratch.\n\
          - When you're done needing web search for this conversation (e.g. the user says thanks, \
            changes topic to something you can answer yourself, or says goodbye), call \
            terminate_search_agent.\n\
+         - If the user names or points at a specific website that hosts its own agent (an A2A \
+           agent, distinct from the search agent above), call discover_a2a_agent with that \
+           site's URL first — it tells you the agent's name, skills, and the actual endpoint to \
+           message it at. Then call send_a2a_message with that endpoint (not the site's root \
+           URL) and your message, and answer the user using its reply. Each send_a2a_message \
+           call is a fresh one-shot exchange, not a remembered conversation like the search \
+           agent's.\n\
          - For anything you can just answer (simple facts, conversation, math), answer directly — \
-           don't spawn the search agent needlessly.\n\
-         - If asked what agents are running, call list_agents.\n\n{}",
+           don't spawn the search agent or call out to another agent needlessly.\n\
+         - If asked what agents are running, call list_agents (this only shows the search agent \
+           if spawned — A2A agents aren't spawned as children, they're just talked to).\n\n{}",
         condesate::tool_instructions(tool_specs)
     )
 }
@@ -165,17 +191,46 @@ async fn main() -> Result<()> {
     // separately-permissioned guards — see `search_agent.rs` for why.
     let storage: Arc<dyn Storage> = InMemoryStorage::new();
 
-    let registry: Registry = Arc::new(tokio::sync::Mutex::new(None));
+    // One shared Bus for both principals — real agent-to-agent messaging,
+    // not an in-process function call (see `search_agent.rs`'s module
+    // docs). The leader's own route is wired in up front, since there's
+    // only ever one leader; the search agent's route is added to this same
+    // bus dynamically, once per spawn, via `Bus::insert_route` — it doesn't
+    // exist yet when the leader boots, so it can't be in the routing table
+    // from the start the way `Swarm::run` wires up a static roster.
+    let (leader_tx, leader_rx) = mpsc::unbounded_channel();
+    let mut routes = HashMap::new();
+    routes.insert(HarnessId::new(LEADER_ID), leader_tx);
+    let bus = Bus::new(routes);
+    // Held (not drained by a background loop — the leader's real driver is
+    // the REPL below) so `ask_search_agent` can block on it for the search
+    // agent's `Payload::Reply` after sending the query as a real
+    // `Payload::Task`.
+    let leader_inbox: Arc<Mutex<Inbox>> = Arc::new(Mutex::new(leader_rx));
+
+    let registry: Registry = Arc::new(Mutex::new(None));
     let terminate_tool = Arc::new(TerminateSearchAgent { registry: registry.clone() });
     let leader_tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(SpawnSearchAgent { registry: registry.clone(), storage: storage.clone(), verbose }),
-        Arc::new(AskSearchAgent { registry: registry.clone() }),
+        Arc::new(SpawnSearchAgent {
+            registry: registry.clone(),
+            storage: storage.clone(),
+            bus: bus.clone(),
+            verbose,
+        }),
+        Arc::new(AskSearchAgent { registry: registry.clone(), leader_inbox }),
         terminate_tool.clone(),
         Arc::new(ListAgents),
+        // A2A ("Agent2Agent") client tools: unlike the search agent above,
+        // these let the leader talk directly to a *specific* agent hosted
+        // on a website the user names, over the standard A2A protocol —
+        // no spawning, no child principal, just an outbound HTTP call the
+        // leader's own `leader-tools` grant already covers.
+        Arc::new(DiscoverA2aAgent::new()?),
+        Arc::new(SendA2aMessage::new()?),
     ];
     let specs: Vec<ToolSpec> = leader_tools.iter().map(|t| t.spec()).collect();
     let leader_agent = BasicAgent::new(LEADER_ID, leader_system_prompt(&specs), model, leader_tools);
-    let (leader_services, audit) = build_leader_services(storage, verbose).await?;
+    let (leader_services, audit) = build_leader_services(storage, bus, verbose).await?;
     if verbose {
         eprintln!("[leader] audit trail: live on stderr as `audit ...` lines below, from here on\n");
     }

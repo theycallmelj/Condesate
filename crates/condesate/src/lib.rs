@@ -71,19 +71,22 @@ pub use agent::{
 pub use agent::{AnthropicModel, OpenAiModel};
 #[cfg(feature = "mcp")]
 pub use agent::{McpConnection, McpTool};
+#[cfg(feature = "a2a")]
+pub use agent::{A2aClient, AgentCard, AgentSkill, DiscoverA2aAgent, SendA2aMessage};
 pub use cache::{
     CacheEntry, CacheKey, CachePool, CacheRegistry, Candidate, Demand, Sidecar, ValueClass,
 };
 pub use faraday::{
-    Diary, DiaryEntry, EntryKind, IdeaBook, InMemoryDiary, InMemoryIdeaBook, Menu, NewDiaryEntry,
-    RetrievalSheet, SheetComposer, Slip, SlipIndex, Speculation, StandardComposer,
+    Diary, DiaryEntry, EntryKind, IdeaBook, InMemoryDiary, InMemoryIdeaBook, InMemorySlipIndex,
+    Menu, NewDiaryEntry, RetrievalSheet, SheetComposer, Slip, SlipIndex, Speculation,
+    StandardComposer,
 };
 pub use security::{
     AccessRequest, Action, AgentInfo, AgentManifest, AgentUid, Admission, AuditEvent, AuditSink,
-    Clock, Compatibility, Decision, Effect, FileAudit, GovernanceLabel, GrantSet, GuardedServices,
-    Kernel, MemoryAudit, ModelClass, Obligation, Outcome, Pattern, PolicyEngine, Principal,
-    Refusal, Resource, ResourcePattern, Rule, RuleSetPolicy, SubjectMatch, SystemClock, TenantId,
-    ToolBroker, TracingAudit, TrustTier,
+    Clock, Compatibility, Condition, Decision, Effect, FileAudit, GovernanceLabel, GrantSet,
+    GuardedServices, Kernel, MemoryAudit, ModelClass, Obligation, Outcome, Pattern, PolicyEngine,
+    Principal, Refusal, Resource, ResourcePattern, Rule, RuleSetPolicy, SubjectMatch, SystemClock,
+    TenantId, ToolBroker, TracingAudit, TrustTier,
 };
 pub use swarm::{
     Bus, Envelope, Harness, Inbox, InMemoryStorage, Payload, Recipient, ServiceHandle,

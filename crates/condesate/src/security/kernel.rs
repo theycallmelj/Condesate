@@ -491,6 +491,17 @@ impl GuardedServices {
         self.inner.send_reply(to, text)
     }
 
+    /// Tell one specific peer to shut down. Gated on `Action::Control`
+    /// against that peer, same as `terminate`-style tools already check
+    /// before tearing anything else down — not `Action::Send`, since this is
+    /// a control signal to the peer's own runtime, not a message meant for
+    /// its agent loop to read and reason about.
+    pub async fn send_shutdown(&self, to: &str) -> Result<()> {
+        let peer = Resource::Peer { id: HarnessId::new(to) };
+        self.check(Action::Control, &peer).await?;
+        self.inner.send_shutdown(to)
+    }
+
     pub async fn broadcast_shutdown(&self) -> Result<()> {
         self.check(Action::Control, &Resource::Swarm).await?;
         self.inner.broadcast_shutdown()

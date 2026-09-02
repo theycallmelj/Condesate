@@ -55,6 +55,12 @@ pub trait IdeaBook: Send + Sync {
             all.iter().filter_map(|s| s.supersedes).collect();
         Ok(all.into_iter().filter(|s| !s.struck && !superseded.contains(&s.id)).collect())
     }
+
+    /// Every topic with at least one speculation jotted under it — the
+    /// `IdeaBook` counterpart of `super::index::Menu::topics`, so a caller
+    /// (a diagnostic dump, a browsing UI) can enumerate everything without
+    /// already knowing what topic names exist.
+    async fn topics(&self) -> Result<Vec<String>>;
 }
 
 /// In-process Idea Book.
@@ -118,6 +124,12 @@ impl IdeaBook for InMemoryIdeaBook {
             .filter_map(|id| entries.get(id).cloned())
             .collect())
     }
+
+    async fn topics(&self) -> Result<Vec<String>> {
+        let mut topics: Vec<String> = self.order.read().await.keys().cloned().collect();
+        topics.sort();
+        Ok(topics)
+    }
 }
 
 #[cfg(test)]
@@ -167,5 +179,14 @@ mod tests {
         book.jot("capacitance", "idea B").await.unwrap();
         assert_eq!(book.by_topic("induction").await.unwrap().len(), 1);
         assert_eq!(book.by_topic("capacitance").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn topics_lists_every_topic_jotted_under_exactly_once() {
+        let book = InMemoryIdeaBook::new();
+        book.jot("induction", "idea A").await.unwrap();
+        book.jot("induction", "idea B").await.unwrap(); // same topic again
+        book.jot("capacitance", "idea C").await.unwrap();
+        assert_eq!(book.topics().await.unwrap(), vec!["capacitance".to_string(), "induction".to_string()]);
     }
 }

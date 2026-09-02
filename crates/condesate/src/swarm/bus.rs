@@ -1,15 +1,23 @@
+
 //! Inter-harness messaging — the swarm's "IPC".
 //!
 //! Each harness owns one `Inbox` (an mpsc receiver). The `Bus` is a cloneable
 //! routing table mapping `HarnessId -> Sender`, so any harness can address any
 //! other by id, or broadcast to everyone. This is the actor-model plumbing that
 //! lets harnesses "talk" the way the swarm-as-OS is supposed to.
+//!
+//! The routing table is mutable behind a `Mutex`, not fixed at construction:
+//! `Swarm::run` still wires up the whole roster before anything starts, but a
+//! principal that dynamically spawns a child (`GuardedServices::spawn_child`,
+//! outside `Swarm` entirely) needs to add that child's inbox to the *same*
+//! bus its own `ServiceHandle` already carries, after the fact — see
+//! [`Bus::insert_route`].
 
 use crate::types::HarnessId;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 /// A message travelling between harnesses.
@@ -45,15 +53,33 @@ pub type Inbox = mpsc::UnboundedReceiver<Envelope>;
 type Outbox = mpsc::UnboundedSender<Envelope>;
 
 /// Cloneable handle used by harnesses to send messages. Built by the swarm once
-/// all harnesses are registered, so the routing table is complete.
+/// all harnesses are registered, so the routing table is complete — or, for a
+/// dynamically-spawned principal outside `Swarm`, extended at runtime via
+/// [`Bus::insert_route`].
 #[derive(Clone)]
 pub struct Bus {
-    routes: Arc<HashMap<HarnessId, Outbox>>,
+    routes: Arc<Mutex<HashMap<HarnessId, Outbox>>>,
 }
 
 impl Bus {
     pub fn new(routes: HashMap<HarnessId, Outbox>) -> Self {
-        Self { routes: Arc::new(routes) }
+        Self { routes: Arc::new(Mutex::new(routes)) }
+    }
+
+    /// Register (or replace) a route at runtime. Every clone of this `Bus`
+    /// shares the same table (it's an `Arc` underneath), so a route added
+    /// here is immediately reachable from every principal already holding a
+    /// clone — in particular, the spawner that just admitted the child whose
+    /// inbox this is.
+    pub fn insert_route(&self, id: HarnessId, tx: Outbox) {
+        self.routes.lock().expect("bus routing table poisoned").insert(id, tx);
+    }
+
+    /// Drop a route, e.g. once a dynamically-spawned principal has torn down
+    /// its inbox — so a later stray send fails loudly (`no route to harness`)
+    /// instead of silently reaching a channel nobody is receiving on anymore.
+    pub fn remove_route(&self, id: &HarnessId) {
+        self.routes.lock().expect("bus routing table poisoned").remove(id);
     }
 
     /// Deliver an envelope according to its `to` field.
@@ -61,7 +87,8 @@ impl Bus {
         match env.to.clone() {
             Recipient::Harness(id) => self.send_to(&id, env),
             Recipient::Broadcast => {
-                for (id, tx) in self.routes.iter() {
+                let routes = self.routes.lock().expect("bus routing table poisoned");
+                for (id, tx) in routes.iter() {
                     // Ignore individual closed receivers during broadcast.
                     let mut e = env.clone();
                     e.to = Recipient::Harness(id.clone());
@@ -73,10 +100,8 @@ impl Bus {
     }
 
     fn send_to(&self, id: &HarnessId, env: Envelope) -> Result<()> {
-        let tx = self
-            .routes
-            .get(id)
-            .ok_or_else(|| anyhow!("no route to harness '{id}'"))?;
+        let routes = self.routes.lock().expect("bus routing table poisoned");
+        let tx = routes.get(id).ok_or_else(|| anyhow!("no route to harness '{id}'"))?;
         tx.send(env).map_err(|_| anyhow!("harness '{id}' inbox is closed"))
     }
 }
@@ -132,6 +157,34 @@ mod tests {
         let err = bus.dispatch(Envelope {
             from: HarnessId::new("a"),
             to: Recipient::Harness(HarnessId::new("ghost")),
+            payload: Payload::Note("x".into()),
+        });
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn insert_route_makes_a_dynamically_spawned_peer_reachable() {
+        let (bus, _inboxes) = wire(&["a"]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        bus.insert_route(HarnessId::new("child"), tx);
+
+        bus.dispatch(Envelope {
+            from: HarnessId::new("a"),
+            to: Recipient::Harness(HarnessId::new("child")),
+            payload: Payload::Task("hi".into()),
+        })
+        .unwrap();
+        let got = rx.recv().await.unwrap();
+        assert_eq!(got.from, HarnessId::new("a"));
+    }
+
+    #[test]
+    fn remove_route_makes_further_sends_fail_loudly() {
+        let (bus, _inboxes) = wire(&["a"]);
+        bus.remove_route(&HarnessId::new("a"));
+        let err = bus.dispatch(Envelope {
+            from: HarnessId::new("a"),
+            to: Recipient::Harness(HarnessId::new("a")),
             payload: Payload::Note("x".into()),
         });
         assert!(err.is_err());

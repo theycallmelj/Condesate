@@ -16,62 +16,62 @@
 //! the broken tool — narrower than "all of them" was always an option, and
 //! this is why it's the right one for `research` specifically.
 //!
-//! There is no background task or bus messaging here: "spawning" means
-//! admitting the child principal and connecting the MCP server; "asking" it
-//! something is a direct, in-process `ReActLoop::run` call against its own
-//! agent and its own guarded services — but a *conversation*, not a fresh
-//! one-shot each time: [`SearchAgentHandle`] keeps its own running
-//! transcript, so a second `ask_search_agent` call is a follow-up with the
-//! first call's findings still in context, the same way `chat-app` keeps a
-//! transcript across turns. The *answer* itself does not come back as a bare
-//! function return, either — the search agent writes it to shared storage
-//! under its own grant, and the leader reads it back under a separate grant
-//! of its own (see [`AskSearchAgent::call`]), so the hand-off is two
-//! independently-checked crossings of the permission boundary, not one.
-//! "Terminating" drops the handle and closes the MCP connection. What
-//! `condesate` actually enforces throughout is the boundary itself — every
-//! one of the search agent's own tool calls is checked against the grant it
-//! was admitted with, not the leader's broader one, and it can't spawn a
-//! grandchild because its own manifest never asked for `Action::Spawn`.
+//! **This is real agent-to-agent messaging, not a function call.** Spawning
+//! the search agent starts [`run_search_actor`] as its own tokio task,
+//! owning its own `Inbox` — a genuine actor, the same shape `StandardHarness`
+//! runs inside a `Swarm`, just registered dynamically (via
+//! `condesate::Bus::insert_route`) since the search agent doesn't exist yet
+//! when the leader boots. `ask_search_agent` sends the query as a real
+//! `Payload::Task` over the shared `Bus` (`GuardedServices::send_task`,
+//! checked against the leader's own `Action::Send` grant) and blocks on the
+//! leader's *own* inbox for the search agent's `Payload::Reply` — two
+//! separately-checked, separately-audited crossings of the permission
+//! boundary, not one direct `ReActLoop::run` call reaching into the search
+//! agent's private state. The search agent keeps its own running transcript
+//! inside its actor loop, across `Payload::Task` messages, so a follow-up
+//! question still has the earlier findings in context, the same way
+//! `chat-app` keeps a transcript across turns — that continuity now lives on
+//! the actor side of the bus instead of in the tool that calls it.
+//! "Terminating" sends a `Payload::Shutdown` to the search agent's inbox
+//! (`GuardedServices::send_shutdown`, gated on `Action::Control` against
+//! that peer) and joins its task, so the actor drains its inbox and closes
+//! the MCP connection before a respawn can race it. What `condesate` enforces
+//! throughout is the boundary itself — every one of the search agent's own
+//! tool calls and bus sends is checked against the grant it was admitted
+//! with, not the leader's broader one, and it can't spawn a grandchild
+//! because its own manifest never asked for `Action::Spawn`.
 
 use anyhow::{anyhow, Context, Result};
 use condesate::{
     tool_instructions, Action, Agent, AgentContext, AgentLoop, AgentManifest, BasicAgent, Bus,
-    GuardedServices, HarnessId, McpConnection, Message, ModelClass, Pattern, ReActLoop, Resource,
-    ResourcePattern, Rule, ServiceHandle, Storage, SubjectMatch, TenantId, Tool, ToolSpec, TrustTier,
+    Envelope, GuardedServices, HarnessId, Inbox, McpConnection, Message, ModelClass, Pattern,
+    Payload, ReActLoop, ResourcePattern, Rule, ServiceHandle, Storage, SubjectMatch, TenantId,
+    Tool, ToolSpec, TrustTier,
 };
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
 
 use crate::model::choose_model;
 
+const LEADER_ID: &str = "leader";
 const SEARCH_AGENT_ID: &str = "search";
 /// The three mcp-duckduckgo tools this agent actually gets — `research` is
 /// excluded; see the module docs for why.
 const WEB_TOOLS: [&str; 3] =
     ["mcp:duckduckgo:search", "mcp:duckduckgo:search_and_crawl", "mcp:duckduckgo:fetch"];
-/// Shared-memory key the answer is handed off through — see the module docs.
+/// Shared-memory key the answer is *also* recorded under — see the module
+/// docs on why the answer's primary path back is a bus `Payload::Reply` now,
+/// with this as a second, independently-audited write under the search
+/// agent's own grant, not the way the leader actually gets its answer.
 const RESULT_KEY: &str = "search/result";
 
+/// A handle to the running search agent: just its background actor task now
+/// — the agent, its transcript, its MCP connection, and its `GuardedServices`
+/// all live inside [`run_search_actor`], reached only through the bus from
+/// here on, never through a direct reference back into that task's state.
 pub struct SearchAgentHandle {
-    services: Arc<GuardedServices>,
-    connection: Arc<McpConnection>,
-    agent: BasicAgent,
-    /// The running conversation with this agent, carried across calls so a
-    /// follow-up question still has the earlier findings (and fetched page
-    /// content) in context.
-    transcript: Vec<Message>,
-    /// Mirrors `VERBOSE` at spawn time — whether this agent's own think
-    /// steps and tool calls get echoed to stderr (see `AgentContext::trace`)
-    /// when `ask_search_agent` drives it.
-    trace: bool,
-}
-
-impl SearchAgentHandle {
-    async fn close(self) {
-        self.connection.close().await;
-    }
+    task: JoinHandle<()>,
 }
 
 pub type Registry = Arc<Mutex<Option<SearchAgentHandle>>>;
@@ -116,17 +116,32 @@ fn search_agent_manifest() -> AgentManifest {
                 &[Action::Write],
                 ResourcePattern::Memory(Pattern::parse("search/*")),
             ),
+            // Lets the search agent reply to the leader over the bus —
+            // attenuated from the leader's own `bus-messaging` root grant
+            // (see `main.rs`), narrowed to exactly this one direction.
+            Rule::allow(
+                "reply-to-leader",
+                SubjectMatch::agent(SEARCH_AGENT_ID),
+                &[Action::Send],
+                ResourcePattern::Peer(Pattern::parse(LEADER_ID)),
+            ),
         ],
         cache_classes: vec![],
     }
 }
 
-async fn spawn(leader: &GuardedServices, storage: Arc<dyn Storage>, verbose: bool) -> Result<SearchAgentHandle> {
+async fn spawn(leader: &GuardedServices, storage: Arc<dyn Storage>, bus: Bus, verbose: bool) -> Result<SearchAgentHandle> {
+    // The search agent doesn't exist when the leader (and its Bus) boots, so
+    // its route is added to the *same* bus at spawn time rather than being
+    // in the routing table from the start — see `Bus::insert_route`.
+    let (tx, inbox) = mpsc::unbounded_channel();
+    bus.insert_route(HarnessId::new(SEARCH_AGENT_ID), tx);
+
     let raw = ServiceHandle {
         me: HarnessId::new(SEARCH_AGENT_ID),
-        roster: Arc::new(vec![HarnessId::new("leader"), HarnessId::new(SEARCH_AGENT_ID)]),
+        roster: Arc::new(vec![HarnessId::new(LEADER_ID), HarnessId::new(SEARCH_AGENT_ID)]),
         storage,
-        bus: Bus::new(HashMap::new()),
+        bus,
     };
     let services = leader
         .spawn_child(&search_agent_manifest(), raw)
@@ -169,7 +184,67 @@ async fn spawn(leader: &GuardedServices, storage: Arc<dyn Storage>, verbose: boo
     );
     let agent = BasicAgent::new(SEARCH_AGENT_ID, system_prompt, model, tools);
 
-    Ok(SearchAgentHandle { services, connection, agent, transcript: Vec::new(), trace: verbose })
+    // The actor itself: a real inbox consumer running on its own task, not a
+    // function this crate calls into. See the module docs and
+    // `run_search_actor`.
+    let task = tokio::spawn(run_search_actor(services, connection, agent, inbox, verbose));
+
+    Ok(SearchAgentHandle { task })
+}
+
+/// The search agent's own message loop. Each inbound `Payload::Task` is
+/// answered with a `ReActLoop::run` over a transcript that persists across
+/// messages (so a follow-up still has earlier findings, including fetched
+/// page content, in context) and the answer travels back as a
+/// `Payload::Reply` addressed to whoever sent the task — over the same `Bus`
+/// `ask_search_agent` used to send it, not a bare function return.
+/// `Payload::Shutdown` drains the loop and closes the MCP connection.
+async fn run_search_actor(
+    services: Arc<GuardedServices>,
+    connection: Arc<McpConnection>,
+    agent: BasicAgent,
+    mut inbox: Inbox,
+    trace: bool,
+) {
+    let mut transcript: Vec<Message> = Vec::new();
+    while let Some(Envelope { from, payload, .. }) = inbox.recv().await {
+        match payload {
+            Payload::Shutdown => break,
+            Payload::Task(query) => {
+                let mut ctx = AgentContext::new(services.clone());
+                ctx.trace = trace;
+                ctx.transcript = std::mem::take(&mut transcript);
+                ctx.transcript.push(Message::user(query));
+
+                let reply = match (ReActLoop { max_steps: 8 }).run(&agent as &dyn Agent, &mut ctx).await {
+                    Ok(outcome) => {
+                        transcript = ctx.transcript;
+                        // A second, independently-audited crossing of the
+                        // permission boundary for the same answer — under
+                        // this agent's own write-only grant — even though
+                        // the leader now gets its copy over the bus reply
+                        // below, not by reading this key back.
+                        if let Err(e) = services.storage_set(RESULT_KEY, &outcome.final_text).await {
+                            eprintln!("[search agent] failed to record result in storage: {e}");
+                        }
+                        outcome.final_text
+                    }
+                    Err(e) => {
+                        transcript = ctx.transcript;
+                        format!("search agent error: {e}")
+                    }
+                };
+
+                if let Err(e) = services.send_reply(&from.to_string(), &reply).await {
+                    eprintln!("[search agent] failed to reply to {from}: {e}");
+                }
+            }
+            other => {
+                eprintln!("[search agent] ignoring unexpected message from {from}: {other:?}");
+            }
+        }
+    }
+    connection.close().await;
 }
 
 pub struct SpawnSearchAgent {
@@ -179,7 +254,14 @@ pub struct SpawnSearchAgent {
     /// this, the search agent's `storage_set` and the leader's `storage_get`
     /// would be writing to and reading from two different stores.
     pub storage: Arc<dyn Storage>,
-    /// `VERBOSE` at startup — see [`SearchAgentHandle::trace`].
+    /// The same `Bus` the leader's own `ServiceHandle` was built with — the
+    /// search agent's inbox is registered onto it at spawn time (see
+    /// `spawn`), so both principals end up addressing each other over one
+    /// shared routing table.
+    pub bus: Bus,
+    /// `VERBOSE` at startup — mirrored into the actor task so its think
+    /// steps, tool calls, and the MCP server's own log line up with the
+    /// leader's own tracing.
     pub verbose: bool,
 }
 
@@ -199,13 +281,19 @@ impl Tool for SpawnSearchAgent {
         if reg.is_some() {
             return Ok("search agent already running".into());
         }
-        *reg = Some(spawn(leader, self.storage.clone(), self.verbose).await?);
+        *reg = Some(spawn(leader, self.storage.clone(), self.bus.clone(), self.verbose).await?);
         Ok("search agent spawned and ready".into())
     }
 }
 
 pub struct AskSearchAgent {
     pub registry: Registry,
+    /// The leader's own inbox. Held here rather than drained by a background
+    /// loop — the leader's real driver is the REPL, not the swarm harness
+    /// loop — so a call can send the query as a genuine `Payload::Task` over
+    /// the bus and then block on this same inbox for the search agent's
+    /// `Payload::Reply`, exactly the way two independent harnesses talk.
+    pub leader_inbox: Arc<Mutex<Inbox>>,
 }
 
 #[async_trait::async_trait]
@@ -224,29 +312,32 @@ impl Tool for AskSearchAgent {
         let query =
             args.get("query").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing string arg 'query'"))?;
 
-        let mut reg = self.registry.lock().await;
-        let handle =
-            reg.as_mut().ok_or_else(|| anyhow!("no search agent running — call spawn_search_agent first"))?;
+        {
+            let reg = self.registry.lock().await;
+            if reg.is_none() {
+                return Err(anyhow!("no search agent running — call spawn_search_agent first"));
+            }
+        }
 
-        // Continue the running conversation rather than starting fresh —
-        // this is what lets a follow-up question reference a page the
-        // agent already fetched.
-        let mut ctx = AgentContext::new(handle.services.clone());
-        ctx.trace = handle.trace;
-        ctx.transcript = handle.transcript.clone();
-        ctx.transcript.push(Message::user(query.to_string()));
-        let outcome = ReActLoop { max_steps: 8 }.run(&handle.agent as &dyn Agent, &mut ctx).await?;
-        handle.transcript = ctx.transcript;
+        // A real cross-principal send — checked against the leader's own
+        // `Action::Send` grant, delivered onto the search agent's actor
+        // inbox — not a direct call into its loop.
+        leader.send_task(SEARCH_AGENT_ID, query).await?;
 
-        // Hand-off through shared storage, not a bare return value: the
-        // search agent writes under its own grant (`write-result` above),
-        // the leader reads under its own (`root_grants` in main.rs) — two
-        // real, separately-audited crossings of the permission boundary.
-        handle.services.storage_set(RESULT_KEY, &outcome.final_text).await?;
-        leader
-            .storage_get(RESULT_KEY)
-            .await?
-            .ok_or_else(|| anyhow!("search agent reported done but wrote no result"))
+        let mut inbox = self.leader_inbox.lock().await;
+        loop {
+            let env = inbox
+                .recv()
+                .await
+                .ok_or_else(|| anyhow!("leader inbox closed while waiting for the search agent's reply"))?;
+            if env.from != HarnessId::new(SEARCH_AGENT_ID) {
+                continue;
+            }
+            match env.payload {
+                Payload::Reply(text) => return Ok(text),
+                other => eprintln!("[leader] ignoring unexpected message from search agent: {other:?}"),
+            }
+        }
     }
 }
 
@@ -265,20 +356,25 @@ impl Tool for TerminateSearchAgent {
     }
 
     async fn call(&self, _args: serde_json::Value, leader: &GuardedServices) -> Result<String> {
-        // A second, independent check beyond the ordinary tool-invoke gate —
-        // the same defense-in-depth pattern `ShutdownSwarm` uses internally
-        // for `broadcast_shutdown`: being allowed to *call this tool* and
-        // being allowed to *control this specific peer* are checked
-        // separately, against separately-requested grants.
-        leader
-            .check(Action::Control, &Resource::Peer { id: HarnessId::new(SEARCH_AGENT_ID) })
-            .await
-            .map_err(|refusal| anyhow!("terminating the search agent was denied: {refusal}"))?;
-
         let mut reg = self.registry.lock().await;
         match reg.take() {
             Some(handle) => {
-                handle.close().await;
+                // `send_shutdown` is its own independent check beyond the
+                // ordinary tool-invoke gate every tool call already goes
+                // through — `Action::Control` against this specific peer,
+                // the same defense-in-depth pattern `ShutdownSwarm` uses
+                // internally for `broadcast_shutdown`.
+                leader
+                    .send_shutdown(SEARCH_AGENT_ID)
+                    .await
+                    .map_err(|e| anyhow!("terminating the search agent was denied: {e}"))?;
+                // Join the actor rather than dropping the handle — it still
+                // needs to drain to the shutdown message and close the MCP
+                // connection, and a respawn right after this call must not
+                // race that teardown.
+                if let Err(e) = handle.task.await {
+                    eprintln!("[leader] search agent task panicked: {e}");
+                }
                 Ok("search agent terminated".into())
             }
             None => Ok("no search agent was running".into()),

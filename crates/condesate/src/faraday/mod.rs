@@ -49,4 +49,4 @@ pub mod index;
 
 pub use diary::{Diary, DiaryEntry, EntryKind, InMemoryDiary, NewDiaryEntry};
 pub use ideabook::{IdeaBook, InMemoryIdeaBook, Speculation};
-pub use index::{Menu, RetrievalSheet, SheetComposer, Slip, SlipIndex, StandardComposer};
+pub use index::{InMemorySlipIndex, Menu, RetrievalSheet, SheetComposer, Slip, SlipIndex, StandardComposer};

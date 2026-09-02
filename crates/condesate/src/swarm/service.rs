@@ -42,6 +42,16 @@ impl ServiceHandle {
         })
     }
 
+    /// Convenience: tell one specific peer to shut down (unlike
+    /// `broadcast_shutdown`, which targets everyone).
+    pub fn send_shutdown(&self, to: impl Into<String>) -> Result<()> {
+        self.bus.dispatch(Envelope {
+            from: self.me.clone(),
+            to: Recipient::Harness(HarnessId::new(to)),
+            payload: Payload::Shutdown,
+        })
+    }
+
     /// Convenience: tell the whole swarm to wind down.
     pub fn broadcast_shutdown(&self) -> Result<()> {
         self.bus.dispatch(Envelope {

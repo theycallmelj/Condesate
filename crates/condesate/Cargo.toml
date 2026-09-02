@@ -20,6 +20,11 @@ remote = ["dep:reqwest"]
 # for the same reason as `remote`. Client-only: spawns a server as a child
 # process and speaks MCP over its stdio.
 mcp = ["dep:rmcp"]
+# A client for agents hosted on other sites, over the A2A ("Agent2Agent")
+# protocol — JSON-RPC 2.0 over HTTP. Off by default for the same reason as
+# `remote`. Client-only: talks to agent cards and endpoints other people
+# host, doesn't serve one.
+a2a = ["dep:reqwest"]
 
 [dependencies]
 tokio = { workspace = true }

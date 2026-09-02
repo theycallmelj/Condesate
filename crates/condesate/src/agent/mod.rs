@@ -10,9 +10,12 @@
 //! | [`loops`] | `AgentLoop` — `SingleShot` / `ReActLoop` |
 //! | [`tool`] | `Tool` and the built-in tools |
 //! | [`mcp`] (feature `mcp`) | `McpConnection` / `McpTool` — tools proxied over the MCP protocol |
+//! | [`a2a`] (feature `a2a`) | `A2aClient` / `DiscoverA2aAgent` / `SendA2aMessage` — a client for agents hosted on other sites, over the A2A protocol |
 //! | [`prompted_tools`] | `PromptedToolModel` — prompted tool-calling for providers with no native tool-use wire format yet |
 //! | [`repl`] | `run_repl` — the turn-by-turn console driver shared by the demo binaries |
 
+#[cfg(feature = "a2a")]
+pub mod a2a;
 pub mod core;
 pub mod loops;
 #[cfg(feature = "mcp")]
@@ -26,6 +29,8 @@ pub mod tool;
 /// Pure provider request/response mapping (always compiled + tested).
 pub mod wire;
 
+#[cfg(feature = "a2a")]
+pub use a2a::{A2aClient, AgentCard, AgentSkill, DiscoverA2aAgent, SendA2aMessage};
 pub use core::{Agent, AgentContext, BasicAgent};
 pub use loops::{AgentLoop, LoopOutcome, ReActLoop, SingleShot};
 #[cfg(feature = "mcp")]
