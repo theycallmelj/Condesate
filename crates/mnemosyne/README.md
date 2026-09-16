@@ -43,18 +43,23 @@ npm install
 npm run dev   # http://localhost:5183
 ```
 
-Or skip the manual steps: set `DEBUG=1` and mnemosyne starts the dashboard's
+Or skip the manual steps: pass `--debug` and mnemosyne starts the dashboard's
 dev server itself (running `npm install` first if `dashboard/node_modules`
 doesn't exist yet) and opens it in your default browser, pre-pointed at the
 right `API_PORT` via a `?api=` query param — no manual reconfiguration even
 if you've changed it from the default. `DASHBOARD_PORT` overrides the
-dashboard's own port (default `5183`). `DEBUG` is independent of
+dashboard's own port (default `5183`). `--debug` is independent of
 `VERBOSE` — one controls whether the dashboard auto-launches, the other
 controls stderr trace detail; combine them freely.
 
 ```bash
-DEBUG=1 cargo run -p mnemosyne
+cargo run -p mnemosyne -- --debug
 ```
+
+It's a flag rather than an env var on purpose: it's the one switch here with a
+visible side effect on your machine (spawning `npm`, opening a browser tab),
+so it should be something you type deliberately when you run it, not something
+a stale line in a `.env` can turn on behind you.
 
 The dashboard is torn down when mnemosyne exits (best-effort — see
 `dashboard.rs`'s `shutdown` doc comment for the one edge case that isn't
@@ -64,27 +69,35 @@ See `dashboard/README.md` for the endpoint list and why the Rust side is
 hand-rolled HTTP rather than a framework (same reasoning `crates/evals`'
 target server already established in this workspace).
 
-## The cadence: `CURATE_EVERY` / `RESET_EVERY`
+## The cadence: `--curate-every` / `--reset-every`
 
-Two env vars, both counted in **turns** — one exchange (your message plus
+Two flags, both counted in **turns** — one exchange (your message plus
 mnemosyne's reply), not raw `Message` struct count:
 
-- `CURATE_EVERY` (default `10`) — every this many turns, morpheus is handed
-  everything since its last pass and builds it into Faraday.
-- `RESET_EVERY` (default `20`) — every this many turns, mnemosyne's own
+- `--curate-every N` (default `1`) — every this many turns, morpheus is
+  handed everything since its last pass and builds it into Faraday. The
+  default curates after *every* turn, so memory fills in as you talk and the
+  dashboard shows it happening rather than staying empty until a pass fires.
+  Raise it to trade that liveness for fewer curator calls.
+- `--reset-every N` (default `20`) — every this many turns, mnemosyne's own
   transcript is cleared. A curation pass always runs immediately before a
-  reset, *regardless* of `CURATE_EVERY`'s own cadence, covering whatever's
+  reset, *regardless* of `--curate-every`'s own cadence, covering whatever's
   accumulated since the last pass — nothing raw is ever dropped without a
-  chance to be remembered first. (If `CURATE_EVERY >= RESET_EVERY`,
-  mnemosyne logs a heads-up at startup: `CURATE_EVERY`'s own cadence would
-  never fire on its own, since the reset always forces a pass first.)
+  chance to be remembered first. (If `--curate-every >= --reset-every`,
+  mnemosyne logs a heads-up at startup: the curation cadence would never fire
+  on its own, since the reset always forces a pass first.)
 
 A final curation pass also runs on `exit`/EOF/Ctrl-D, so nothing said right
 before quitting is lost either.
 
 ```bash
-CURATE_EVERY=5 RESET_EVERY=15 cargo run -p mnemosyne
+cargo run -p mnemosyne -- --curate-every 5 --reset-every 15
 ```
+
+Note that curation is awaited inline between turns: at `--curate-every 1` you
+see a `[morpheus] curating 1 turn(s)...` pause before the next `you>` prompt.
+That pause is the curator actually running, and it's what makes the dashboard
+update in step with the conversation.
 
 ## What's actually real here
 

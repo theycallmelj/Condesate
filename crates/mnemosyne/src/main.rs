@@ -11,18 +11,20 @@
 //! startup and reused for the life of the process, not per-message. stdout is
 //! pure chat by default; set `VERBOSE=1` to see every check either agent
 //! makes live on stderr, and/or `AUDIT_LOG_PATH` to append them to a file.
-//! See `memory.rs` for how `faraday` gets wired into real tools, and the
-//! README for the cadence config (`CURATE_EVERY`, `RESET_EVERY`).
+//! See `memory.rs` for how `faraday` gets wired into real tools. Curation
+//! runs after every turn by default so memory (and the dashboard reading it)
+//! keeps up with the conversation; `--curate-every N` / `--reset-every N`
+//! change that cadence — see `parse_args` and the README.
 //!
 //! A read-only diagnostic HTTP API also starts alongside the chat loop (see
 //! `api.rs`) — what `dashboard/`, a small React app, polls to show every
-//! agent, everything in memory, and the audit trail live while you chat. Set
-//! `DEBUG=1` to have mnemosyne start the dashboard's own dev server and open
+//! agent, everything in memory, and the audit trail live while you chat. Pass
+//! `--debug` to have mnemosyne start the dashboard's own dev server and open
 //! it in your browser automatically (see `dashboard.rs`) — independent of
 //! `VERBOSE`, which controls stderr trace detail instead.
 //!
-//! Run: `cargo run -p mnemosyne` (needs PROVIDER + an API key, e.g. in
-//! `.env`).
+//! Run: `cargo run -p mnemosyne [-- --debug] [-- --curate-every N]` (needs
+//! PROVIDER + an API key, e.g. in `.env`).
 
 mod api;
 mod dashboard;
@@ -68,7 +70,24 @@ const MORPHEUS_MAX_STEPS: usize = 16;
 /// This cap bounds the wasted calls when it happens; it does not claim to
 /// eliminate the behavior itself. 8 comfortably covers legitimate work
 /// (record + tag for 3-4 distinct facts) while keeping the worst case cheap.
-const MORPHEUS_STEPS_PER_PASS_CAP: u32 = 8;
+const MORPHEUS_STEPS_PER_PASS_CAP: u32 = 5;
+/// The same backstop, staggered by curation stage — and the reason it's three
+/// numbers rather than one.
+///
+/// `Condition::StepsUnder` is evaluated against the activation's *shared*
+/// step counter, so a single cap across all six tools is a budget the first
+/// stage can spend entirely. Live-observed, and exactly what happened: on a
+/// one-turn batch morpheus re-recorded the same fact seven times, hit the cap,
+/// and was then denied `tag_slip` — the pass produced no slips and never
+/// reached `jot_idea` at all, so the IdeaBook stayed permanently empty. The
+/// backstop meant to bound a runaway had starved the rest of the job.
+///
+/// Giving the later stages higher ceilings reserves budget for them: once the
+/// counter passes 5 the recorder stops being permitted while tagging and
+/// idea-jotting still are. A runaway recorder now costs its own stage, not
+/// the whole pass.
+const MORPHEUS_TAG_STEPS_CAP: u32 = 9;
+const MORPHEUS_IDEA_STEPS_CAP: u32 = 13;
 
 /// The root authority: broad tool-invoke (covers both agents' tool names —
 /// each still only *requests* the narrow slice it actually needs, see
@@ -162,13 +181,20 @@ async fn spawn_morpheus(
     let requested: Vec<Rule> = tool_names
         .iter()
         .map(|name| {
+            // Per-stage ceilings against one shared counter — see
+            // `MORPHEUS_TAG_STEPS_CAP` for why this isn't a single number.
+            let max_steps = match *name {
+                "record_diary_entry" => MORPHEUS_STEPS_PER_PASS_CAP,
+                "tag_slip" => MORPHEUS_TAG_STEPS_CAP,
+                _ => MORPHEUS_IDEA_STEPS_CAP,
+            };
             Rule::allow(
                 &format!("curate-{name}"),
                 SubjectMatch::agent(MORPHEUS_ID),
                 &[Action::Invoke],
                 ResourcePattern::Tool(Pattern::Exact(name.to_string())),
             )
-            .with_conditions(vec![Condition::StepsUnder { max_steps: MORPHEUS_STEPS_PER_PASS_CAP }])
+            .with_conditions(vec![Condition::StepsUnder { max_steps }])
         })
         .collect();
     let manifest = AgentManifest {
@@ -238,11 +264,17 @@ fn morpheus_system_prompt(tool_specs: &[ToolSpec]) -> String {
             reusable topic name — this is what makes it findable later via recall_memory. Reuse \
             existing topic names when the new material is about the same thing as before, rather \
             than inventing near-duplicate topics.\n\
-         3. For anything still open, tentative, or unresolved (not yet worth committing to the \
-            permanent record), call jot_idea instead. If it relates to something you or an \
-            earlier curation pass already jotted, call list_live_ideas on that topic first — \
-            then revise_idea to update it in place, or strike_idea if it's now settled or turned \
-            out wrong, rather than jotting a disconnected duplicate.\n\
+         3. Then, before you stop, look back over the same batch for anything *unsettled* and \
+            call jot_idea for it. This is not an optional afterthought — it is half the job, and \
+            most batches contain something: an open question, a decision not yet made, a guess \
+            or inference you drew that the conversation hasn't confirmed, a stated intention, \
+            something the user said they'd revisit. A fact you recorded in step 1 can also have \
+            an open thread hanging off it — record the settled part, jot the unsettled part. If \
+            it relates to something you or an earlier curation pass already jotted, call \
+            list_live_ideas on that topic first — then revise_idea to update it in place, or \
+            strike_idea if it's now settled or turned out wrong, rather than jotting a \
+            disconnected duplicate. Only skip this step if the batch genuinely contains nothing \
+            open at all.\n\
          Once you've processed the whole batch, stop calling tools and reply with a one-line \
          summary of what you recorded. Be selective — not every line of small talk needs a diary \
          entry.\n\n\
@@ -288,26 +320,93 @@ async fn curate(
     Ok(())
 }
 
+const USAGE: &str = "usage: mnemosyne [--debug] [--curate-every N] [--reset-every N]\n\n  \
+     --debug            also start the dashboard's dev server and open it in your browser\n  \
+     --curate-every N   turns between morpheus's curation passes (default 1: every turn)\n  \
+     --reset-every N    turns between wipes of mnemosyne's own transcript (default 20)\n  \
+     -h, --help         print this message";
+
+/// Everything you'd want to vary between two runs of the same demo, on the
+/// command line where you can see it.
+///
+/// These are flags rather than env vars on purpose. `--debug` has a visible
+/// side effect on the machine (it spawns `npm` and opens a browser tab) and
+/// the cadence knobs are the two numbers you actually tune while showing
+/// this thing to someone — neither should be something a stale line in a
+/// `.env` file decides for you. Parsed by hand: three options don't justify
+/// a CLI framework, the same reasoning `api.rs` uses for its HTTP routes.
+struct Args {
+    debug: bool,
+    /// Turns between curation passes. Defaults to 1 — morpheus curates after
+    /// every exchange, so Faraday (and the dashboard reading it) reflects the
+    /// conversation as it happens rather than going bare until a pass fires.
+    curate_every: usize,
+    /// Turns between wipes of mnemosyne's own transcript. A curation pass
+    /// always runs immediately before a reset regardless of `curate_every`,
+    /// so nothing raw is dropped unremembered.
+    reset_every: usize,
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        Self { debug: false, curate_every: 1, reset_every: 20 }
+    }
+}
+
+fn parse_args() -> Result<Args> {
+    let mut args = Args::default();
+    let mut argv = std::env::args().skip(1);
+    while let Some(arg) = argv.next() {
+        // `--flag N` and `--flag=N` both work; a count with no value is a
+        // typo worth failing on, not a silent fallback to the default.
+        let mut value = |flag: &str| -> Result<usize> {
+            let raw = match arg.split_once('=') {
+                Some((_, v)) => v.to_string(),
+                None => argv.next().ok_or_else(|| {
+                    anyhow::anyhow!("{flag} needs a number, e.g. `{flag} 5`\n\n{USAGE}")
+                })?,
+            };
+            let n: usize = raw
+                .parse()
+                .map_err(|_| anyhow::anyhow!("{flag} needs a number, got '{raw}'\n\n{USAGE}"))?;
+            if n == 0 {
+                anyhow::bail!("{flag} must be at least 1");
+            }
+            Ok(n)
+        };
+
+        match arg.split('=').next().unwrap_or(&arg) {
+            "--debug" => args.debug = true,
+            "--curate-every" => args.curate_every = value("--curate-every")?,
+            "--reset-every" => args.reset_every = value("--reset-every")?,
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                std::process::exit(0);
+            }
+            other => anyhow::bail!("unknown argument '{other}'\n\n{USAGE}"),
+        }
+    }
+    Ok(args)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before anything else, so a typo'd flag fails immediately rather than
+    // after loading `.env` and reaching out for a model.
+    let args = parse_args()?;
+
     dotenvy::dotenv().ok();
     let verbose = std::env::var("VERBOSE").is_ok();
 
-    // "Messages" here means turns — one exchange (your input plus
-    // mnemosyne's reply) — not raw `Message` struct count, which would be
-    // roughly double this and harder to reason about from the chat.
-    let curate_every: usize =
-        std::env::var("CURATE_EVERY").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
-    let reset_every: usize =
-        std::env::var("RESET_EVERY").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
-    if curate_every == 0 || reset_every == 0 {
-        anyhow::bail!("CURATE_EVERY and RESET_EVERY must both be at least 1");
-    }
+    // "Turns" throughout — one exchange (your input plus mnemosyne's reply) —
+    // not raw `Message` struct count, which would be roughly double this and
+    // harder to reason about from the chat.
+    let (curate_every, reset_every) = (args.curate_every, args.reset_every);
     if curate_every >= reset_every {
         eprintln!(
-            "[mnemosyne] note: CURATE_EVERY ({curate_every}) >= RESET_EVERY ({reset_every}) — \
-             curation will only ever run right before a reset forces it, CURATE_EVERY's own \
-             cadence never fires on its own"
+            "[mnemosyne] note: --curate-every ({curate_every}) >= --reset-every ({reset_every}) — \
+             curation will only ever run right before a reset forces it, its own cadence never \
+             fires on its own"
         );
     }
 
@@ -326,7 +425,12 @@ async fn main() -> Result<()> {
     let bank = MemoryBank::new(Arc::new(SystemClock));
     let (morpheus_services, morpheus_agent, morpheus_label) =
         spawn_morpheus(&mnemosyne_services, bank.clone(), &morpheus_model_name).await?;
-    eprintln!("[morpheus] model: {morpheus_label} (curates every {curate_every} messages, before every {reset_every}-message reset)");
+    let cadence = if curate_every == 1 {
+        "curates every turn".to_string()
+    } else {
+        format!("curates every {curate_every} turns")
+    };
+    eprintln!("[morpheus] model: {morpheus_label} ({cadence}, and before every {reset_every}-turn reset)");
 
     let api_port: u16 = std::env::var("API_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(4477);
     let api_addr = format!("127.0.0.1:{api_port}");
@@ -343,10 +447,9 @@ async fn main() -> Result<()> {
     }
     eprintln!("[mnemosyne] diagnostic API starting on http://{api_addr} (see dashboard/ for a UI)");
 
-    let debug = std::env::var("DEBUG").is_ok();
     let dashboard_port: u16 =
         std::env::var("DASHBOARD_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(5183);
-    let dashboard_child = if debug {
+    let dashboard_child = if args.debug {
         match dashboard::launch(dashboard_port, &format!("http://{api_addr}")).await {
             Ok(child) => Some(child),
             Err(e) => {
@@ -414,20 +517,20 @@ async fn main() -> Result<()> {
             // cadence — nothing raw is ever dropped without a chance to be
             // remembered first.
             eprintln!(
-                "[morpheus] curating {} message(s) before context reset...",
+                "[morpheus] curating {} turn(s) before context reset...",
                 (transcript.len() - curated_through) / 2
             );
             curation_pass += 1;
             if let Err(e) = curate(&morpheus_agent, morpheus_services.clone(), verbose, curation_pass, &transcript[curated_through..]).await {
                 eprintln!("[morpheus] curation error: {e}");
             }
-            eprintln!("[mnemosyne] context reset after {reset_every} messages — long-term memory kept in Faraday, recall it with recall_memory");
+            eprintln!("[mnemosyne] context reset after {reset_every} turns — long-term memory kept in Faraday, recall it with recall_memory");
             transcript.clear();
             curated_through = 0;
             messages_since_curation = 0;
             messages_since_reset = 0;
         } else if messages_since_curation >= curate_every {
-            eprintln!("[morpheus] curating {} message(s)...", (transcript.len() - curated_through) / 2);
+            eprintln!("[morpheus] curating {} turn(s)...", (transcript.len() - curated_through) / 2);
             curation_pass += 1;
             if let Err(e) = curate(&morpheus_agent, morpheus_services.clone(), verbose, curation_pass, &transcript[curated_through..]).await {
                 eprintln!("[morpheus] curation error: {e}");

@@ -129,6 +129,22 @@ main {
   color: var(--accent);
 }
 
+.filter {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: -0.35rem 0 0.6rem;
+  font-size: 0.8rem;
+  color: var(--dim);
+  cursor: pointer;
+  user-select: none;
+}
+
+.filter input {
+  cursor: pointer;
+  margin: 0;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;

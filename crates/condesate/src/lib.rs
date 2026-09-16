@@ -86,7 +86,7 @@ pub use security::{
     Clock, Compatibility, Condition, Decision, Effect, FileAudit, GovernanceLabel, GrantSet,
     GuardedServices, Kernel, MemoryAudit, ModelClass, Obligation, Outcome, Pattern, PolicyEngine,
     Principal, Refusal, Resource, ResourcePattern, Rule, RuleSetPolicy, SubjectMatch, SystemClock,
-    TenantId, ToolBroker, TracingAudit, TrustTier,
+    TenantId, ToolBroker, TracingAudit, TrustTier, STRUCTURAL_VISIBILITY,
 };
 pub use swarm::{
     Bus, Envelope, Harness, Inbox, InMemoryStorage, Payload, Recipient, ServiceHandle,

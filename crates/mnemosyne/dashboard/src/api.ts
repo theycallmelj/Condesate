@@ -73,15 +73,29 @@ async function getJson<T>(base: string, path: string): Promise<T> {
   return (await res.json()) as T;
 }
 
-/** One round-trip per endpoint, all in parallel — a single "refresh". */
-export async function fetchSnapshot(base: string): Promise<Snapshot> {
-  const [agents, diary, topics, slips, ideas, audit] = await Promise.all([
-    getJson<Agent[]>(base, "/api/agents"),
+/**
+ * The agent roster, fetched on its own and deliberately rarely.
+ *
+ * `/api/agents` is the one endpoint whose *read* is itself audited — it goes
+ * through `GuardedServices::list_agents`, which decides and records once per
+ * agent. Polling it on the fast loop meant the dashboard generated two audit
+ * events every few seconds forever, burying the handful of events that
+ * represent actual agent work under an observer that only ever watched. The
+ * roster also barely changes: morpheus is spawned once at startup. So this is
+ * fetched on load, on manual refresh, and otherwise on a slow timer.
+ */
+export async function fetchAgents(base: string): Promise<Agent[]> {
+  return getJson<Agent[]>(base, "/api/agents");
+}
+
+/** Everything that actually moves turn to turn. One round-trip each, in parallel. */
+export async function fetchSnapshot(base: string): Promise<Omit<Snapshot, "agents">> {
+  const [diary, topics, slips, ideas, audit] = await Promise.all([
     getJson<DiaryEntry[]>(base, "/api/memory/diary"),
     getJson<string[]>(base, "/api/memory/topics"),
     getJson<Slip[]>(base, "/api/memory/slips"),
     getJson<Idea[]>(base, "/api/memory/ideas"),
     getJson<AuditEvent[]>(base, "/api/audit"),
   ]);
-  return { agents, diary, topics, slips, ideas, audit };
+  return { diary, topics, slips, ideas, audit };
 }

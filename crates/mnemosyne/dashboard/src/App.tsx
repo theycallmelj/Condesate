@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
-import { fetchSnapshot, type Snapshot } from "./api";
+import { fetchAgents, fetchSnapshot, type Snapshot } from "./api";
 
 const DEFAULT_BASE = "http://127.0.0.1:4477";
 const POLL_MS = 3000;
+// The roster changes about once per run (morpheus is spawned at startup) and
+// reading it is an audited crossing, so it gets its own far slower loop.
+const AGENTS_POLL_MS = 30000;
 
 function formatTime(ms: number): string {
   return new Date(ms).toLocaleTimeString();
@@ -10,6 +13,15 @@ function formatTime(ms: number): string {
 
 function isDenial(decision: string): boolean {
   return decision.startsWith("Deny") || decision.startsWith("Escalate");
+}
+
+// Reads attributed to `condesate::STRUCTURAL_VISIBILITY` — a principal seeing
+// itself and the children it spawned. In this app that is almost entirely
+// *this dashboard* polling /api/agents, i.e. the observer showing up in its
+// own observations. Real, correctly recorded, and not what you're looking at
+// the trail to see, so it's collapsed by default rather than dropped.
+function isIntrospection(decision: string): boolean {
+  return decision.includes("structural:self-or-descendant");
 }
 
 function AgentsPanel({ agents }: { agents: Snapshot["agents"] }) {
@@ -154,13 +166,28 @@ function IdeasPanel({ ideas }: { ideas: Snapshot["ideas"] }) {
 }
 
 function AuditPanel({ audit }: { audit: Snapshot["audit"] }) {
+  const [showIntrospection, setShowIntrospection] = useState(false);
+
   const denied = audit.filter((e) => isDenial(e.decision)).length;
-  const sorted = [...audit].sort((a, b) => b.seq - a.seq);
+  const introspection = audit.filter((e) => isIntrospection(e.decision)).length;
+  const shown = showIntrospection ? audit : audit.filter((e) => !isIntrospection(e.decision));
+  const sorted = [...shown].sort((a, b) => b.seq - a.seq);
+
   return (
     <section className="panel">
       <h2>
         Audit ({audit.length} checked, {denied} denied)
       </h2>
+      {introspection > 0 && (
+        <label className="filter">
+          <input
+            type="checkbox"
+            checked={showIntrospection}
+            onChange={(e) => setShowIntrospection(e.target.checked)}
+          />
+          show this dashboard&rsquo;s own roster reads ({introspection})
+        </label>
+      )}
       <table>
         <thead>
           <tr>
@@ -181,10 +208,10 @@ function AuditPanel({ audit }: { audit: Snapshot["audit"] }) {
               <td className="mono dim decision">{e.decision}</td>
             </tr>
           ))}
-          {audit.length === 0 && (
+          {sorted.length === 0 && (
             <tr>
               <td colSpan={5} className="empty">
-                no checks recorded yet
+                {audit.length === 0 ? "no checks recorded yet" : "no agent activity yet — only roster reads so far"}
               </td>
             </tr>
           )}
@@ -195,7 +222,7 @@ function AuditPanel({ audit }: { audit: Snapshot["audit"] }) {
 }
 
 function initialBase(): string {
-  // mnemosyne's DEBUG mode opens the dashboard with ?api=<its actual
+  // mnemosyne's --debug mode opens the dashboard with ?api=<its actual
   // API_PORT> — that always wins, since it reflects how THIS run was
   // actually configured, not whatever was saved from a previous one.
   const fromQuery = new URLSearchParams(window.location.search).get("api");
@@ -204,7 +231,8 @@ function initialBase(): string {
 
 export default function App() {
   const [base, setBase] = useState(initialBase);
-  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [snapshot, setSnapshot] = useState<Omit<Snapshot, "agents"> | null>(null);
+  const [agents, setAgents] = useState<Snapshot["agents"]>([]);
   const [error, setError] = useState<string | null>(null);
   const [lastRefresh, setLastRefresh] = useState<number | null>(null);
 
@@ -219,12 +247,33 @@ export default function App() {
     }
   }, [base]);
 
+  // Separate and slow on purpose — reading the roster is itself an audited
+  // crossing, so polling it at the fast cadence drowns the trail. See
+  // `fetchAgents`.
+  const refreshAgents = useCallback(async () => {
+    try {
+      setAgents(await fetchAgents(base));
+    } catch {
+      // A roster that fails to refresh isn't worth clearing the panel over;
+      // the fast loop above surfaces connection errors already.
+    }
+  }, [base]);
+
+  const refreshAll = useCallback(() => {
+    void refresh();
+    void refreshAgents();
+  }, [refresh, refreshAgents]);
+
   useEffect(() => {
     localStorage.setItem("mnemosyne-api-base", base);
-    refresh();
-    const id = setInterval(refresh, POLL_MS);
-    return () => clearInterval(id);
-  }, [base, refresh]);
+    refreshAll();
+    const fast = setInterval(refresh, POLL_MS);
+    const slow = setInterval(refreshAgents, AGENTS_POLL_MS);
+    return () => {
+      clearInterval(fast);
+      clearInterval(slow);
+    };
+  }, [base, refresh, refreshAgents, refreshAll]);
 
   return (
     <div className="app">
@@ -235,7 +284,7 @@ export default function App() {
             API base
             <input value={base} onChange={(e) => setBase(e.target.value)} spellCheck={false} />
           </label>
-          <button onClick={refresh}>refresh now</button>
+          <button onClick={refreshAll}>refresh now</button>
           <span className="status">
             {error ? (
               <span className="error">⚠ {error}</span>
@@ -250,7 +299,7 @@ export default function App() {
 
       {snapshot && (
         <main>
-          <AgentsPanel agents={snapshot.agents} />
+          <AgentsPanel agents={agents} />
           <DiaryPanel diary={snapshot.diary} />
           <SlipsPanel topics={snapshot.topics} slips={snapshot.slips} />
           <IdeasPanel ideas={snapshot.ideas} />

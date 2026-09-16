@@ -1,5 +1,5 @@
 //! Launches `dashboard/`'s Vite dev server and opens it in the default
-//! browser when `DEBUG=1` — see `main.rs`. A dev convenience, not something
+//! browser when `--debug` is passed — see `main.rs`. A dev convenience, not something
 //! the rest of mnemosyne depends on: a failure here is logged and mnemosyne
 //! keeps running without it, same as any other opt-in diagnostic.
 

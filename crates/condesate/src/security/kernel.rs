@@ -54,6 +54,14 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Attributed in the audit trail to authority that is *structural* rather
+/// than granted — currently only a principal's view of itself and of the
+/// descendants it spawned (see [`GuardedServices::list_agents`]). Named as a
+/// pseudo-rule so a reader of the trail can tell at a glance that no rule in
+/// any `GrantSet` authorized this and none can revoke it, without that
+/// access having to masquerade as either an ordinary allow or a denial.
+pub const STRUCTURAL_VISIBILITY: &str = "structural:self-or-descendant";
+
 // ---------------------------------------------------------------------------
 // Refusals
 // ---------------------------------------------------------------------------
@@ -389,8 +397,30 @@ impl GuardedServices {
         resource: &Resource,
         ctx: RequestContext,
     ) -> std::result::Result<Vec<Obligation>, Refusal> {
+        self.decide_and_audit(action, resource, ctx, None).await
+    }
+
+    /// The one place a decision is reached, recorded, and returned.
+    ///
+    /// `structural_allow` is the sole way to grant access the *rules* didn't:
+    /// when set, a bare default-deny (and only that — an explicit deny, an
+    /// escalation, or a stale epoch still wins) becomes an allow attributed
+    /// to the named pseudo-rule. It exists so that authority which is
+    /// structural rather than granted — see [`Self::list_agents`] — is
+    /// decided *before* anything is written, never patched up afterwards by
+    /// the caller. An audit record that says DENY for access the kernel then
+    /// handed over is worse than a noisy log: it is a false one, and the
+    /// whole point of this trail is that it can be trusted against the
+    /// behaviour it describes.
+    async fn decide_and_audit(
+        &self,
+        action: Action,
+        resource: &Resource,
+        ctx: RequestContext,
+        structural_allow: Option<&str>,
+    ) -> std::result::Result<Vec<Obligation>, Refusal> {
         let current = self.kernel.epoch();
-        let decision = if current != self.grants.epoch {
+        let mut decision = if current != self.grants.epoch {
             Decision::Deny {
                 rule: None,
                 reason: DenyReason::StaleEpoch { held: self.grants.epoch, current },
@@ -404,6 +434,12 @@ impl GuardedServices {
                 )
                 .await
         };
+
+        if let (Some(rule), Decision::Deny { reason: DenyReason::NoMatchingRule, .. }) =
+            (structural_allow, &decision)
+        {
+            decision = Decision::Allow { rule: RuleId::new(rule), obligations: Vec::new() };
+        }
 
         let obligations = match &decision {
             Decision::Allow { obligations, .. } => obligations.clone(),
@@ -646,12 +682,16 @@ impl GuardedServices {
     ///   the target's *role name* (never its uid, which cannot appear in a
     ///   rule authored before that instance is ever admitted).
     ///
-    /// Every candidate still goes through [`Self::check`] — including
-    /// structurally-visible ones — so the epoch-staleness guard applies
-    /// uniformly and every decision lands on the audit trail, including the
-    /// default-deny a structural entry silently overrides. An *explicit* deny
-    /// on `Resource::Agent` still wins even for a descendant: structural
-    /// visibility overrides the absence of a rule, not a rule that says no.
+    /// Every candidate is decided and audited uniformly — including
+    /// structurally-visible ones — so the epoch-staleness guard applies to
+    /// all of them and every decision lands on the audit trail. A structural
+    /// entry is recorded as `ALLOW[structural:self-or-descendant]`
+    /// ([`STRUCTURAL_VISIBILITY`]), decided *before* the record is written
+    /// rather than patched onto the result afterwards: the trail says the
+    /// entry was returned because it was, in fact, returned. An *explicit*
+    /// deny on `Resource::Agent` still wins even for a descendant, and is
+    /// audited as the denial it is — structural visibility overrides the
+    /// absence of a rule, never a rule that says no.
     pub async fn list_agents(&self) -> Result<Vec<AgentInfo>> {
         let all = self.kernel.agents_snapshot();
         let parents: HashMap<AgentUid, Option<AgentUid>> =
@@ -670,12 +710,24 @@ impl GuardedServices {
         let mut visible = Vec::with_capacity(all.len());
         for info in all {
             let structural = info.uid == self.principal.uid || is_descendant_of_me(info.uid);
-            match self.check(Action::Read, &Resource::Agent { agent: info.name.clone() }).await {
-                Ok(_) => visible.push(info),
-                Err(Refusal::Denied(Denied { reason: DenyReason::NoMatchingRule, .. })) if structural => {
-                    visible.push(info);
-                }
-                Err(_) => {} // explicit deny, escalation, or stale epoch: stays hidden
+            // Structural visibility is folded into the decision itself, not
+            // applied to the result afterwards, so the audit records what
+            // actually happened: `ALLOW[structural:self-or-descendant]` for
+            // an entry that *was* returned, rather than a denial contradicted
+            // by the value handed back. An explicit deny, an escalation, or a
+            // stale epoch still hides the entry — being someone's child was
+            // never meant to outrank a rule that names you.
+            let resource = Resource::Agent { agent: info.name.clone() };
+            let verdict = self
+                .decide_and_audit(
+                    Action::Read,
+                    &resource,
+                    self.context(),
+                    structural.then_some(STRUCTURAL_VISIBILITY),
+                )
+                .await;
+            if verdict.is_ok() {
+                visible.push(info);
             }
         }
         Ok(visible)
@@ -1039,6 +1091,63 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].uid, adm.principal.uid);
         assert_eq!(seen[0].name, "worker");
+    }
+
+    /// The audit trail must agree with what `list_agents` actually handed
+    /// back. A structurally-visible entry is *returned*, so recording the
+    /// bare default-deny that the rules alone would have produced would make
+    /// the trail contradict the call it describes.
+    #[tokio::test]
+    async fn a_structurally_visible_agent_is_audited_as_an_allow_not_a_denial() {
+        let (kernel, audit) = kernel_with(GrantSet::default()); // no rules whatsoever
+        let adm = kernel.admit(&manifest("worker", TrustTier::Standard, vec![]), None);
+        let svc = kernel.attach(&adm, services("worker"));
+
+        let seen = svc.list_agents().await.unwrap();
+        assert_eq!(seen.len(), 1, "self is structurally visible");
+
+        let event = audit.events().await.pop().unwrap();
+        assert_eq!(event.resource, "agent:worker");
+        match event.decision {
+            Decision::Allow { rule, .. } => assert_eq!(rule.0, STRUCTURAL_VISIBILITY),
+            other => panic!("structural visibility should audit as an allow, got {other:?}"),
+        }
+        assert_eq!(event.outcome, Outcome::Completed);
+        assert!(audit.refusals().await.is_empty(), "nothing was actually refused");
+    }
+
+    /// The other half: structural visibility overrides the *absence* of a
+    /// rule, never a rule that says no — and that denial is audited honestly,
+    /// because the entry really was withheld.
+    #[tokio::test]
+    async fn an_explicit_deny_still_hides_a_descendant_and_audits_as_a_denial() {
+        let deny_children = Rule::deny(
+            "no-peeking",
+            SubjectMatch::agent("parent"),
+            &[Action::Read],
+            ResourcePattern::Agent(Pattern::parse("child")),
+        );
+        let (kernel, audit) = kernel_with(GrantSet::new(vec![
+            spawn_rule("parent", "child"),
+            deny_children.clone(),
+        ]));
+        let adm = kernel.admit(
+            &manifest("parent", TrustTier::Privileged, vec![spawn_rule("parent", "child"), deny_children]),
+            None,
+        );
+        let svc = kernel.attach(&adm, services("parent"));
+        let _child = svc
+            .spawn_child(&manifest("child", TrustTier::Standard, vec![]), services("child"))
+            .await
+            .unwrap();
+
+        let seen = svc.list_agents().await.unwrap();
+        let names: Vec<&str> = seen.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["parent"], "an explicit deny outranks being the spawner");
+        assert!(
+            audit.refusals().await.iter().any(|e| e.resource == "agent:child"),
+            "the withheld entry is audited as the denial it is"
+        );
     }
 
     #[tokio::test]
