@@ -1,0 +1,19 @@
+[package]
+name = "leader-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A two-agent demo: a leader that dynamically spawns and terminates a web-search agent (real MCP server), both driven by the same live model from .env."
+
+[[bin]]
+name = "leader-search"
+path = "src/main.rs"
+
+[dependencies]
+condesate = { path = "../condesate", features = ["mcp", "remote", "a2a"] }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+dotenvy = "0.15"

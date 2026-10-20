@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/condesate", "crates/chat-app", "crates/evals", "crates/leader-search", "crates/mnemosyne"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "Apache-2.0"
+repository = "https://github.com/theycallmelj/ai-swarm"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "io-util", "net", "process", "fs"] }
+async-trait = "0.1"
+anyhow = "1"
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }

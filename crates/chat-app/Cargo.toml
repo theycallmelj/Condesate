@@ -1,0 +1,19 @@
+[package]
+name = "chat-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A simple REPL chat app built on condesate. Offline by default; real providers behind the `remote` feature."
+
+[features]
+default = []
+# Enable real OpenAI / Anthropic connectivity (pulls reqwest via condesate).
+remote = ["condesate/remote"]
+
+[dependencies]
+condesate = { path = "../condesate" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+dotenvy = "0.15"
