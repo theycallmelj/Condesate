@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "A trait-driven AI agent harness with a swarm layer that behaves like a tiny OS."
+readme = "README.md"
+keywords = ["agent", "llm", "ai", "swarm", "mcp"]
+categories = ["asynchronous", "development-tools"]
+documentation = "https://docs.rs/condesate"
 
 [lib]
 name = "condesate"
